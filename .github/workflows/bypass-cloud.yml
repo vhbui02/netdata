@@ -1,0 +1,112 @@
+name: Bypass Cloud
+
+on:
+  schedule:
+    - cron: "0 0 * * 0" # runs at 00:00 every Sunday
+  workflow_dispatch:
+
+jobs:
+  bypass-cloud:
+    runs-on: ubuntu-latest
+    env:
+      FEATURE_BRANCH: "bypass-cloud"
+    steps:
+      - name: Checkout fork repository and feature branch
+        id: checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.FEATURE_BRANCH }}
+          fetch-depth: 0 # get the full history required for rebasing
+          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }} # custom PAT
+
+      - name: Add bypass logic
+        run: |
+          # Docs: https://github.com/actions/checkout?tab=readme-ov-file#push-a-commit-using-the-built-in-token
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Add upstream repository and fetch its default branch
+          git remote add upstream https://github.com/netdata/netdata.git
+          git fetch upstream master
+
+          # "Check out and wipe whatever is on feature branch and resetting it to look exactly like upstream 'master' right now."
+          git checkout -B $FEATURE_BRANCH upstream/master
+
+          # Check if an exact line exists inside an exact function
+          if ! sed -n '/static inline bool http_access_user_has_enough_access_level_for_endpoint/,/}/p' "src/web/api/http_auth.h" | grep -q "return ((user & endpoint) == endpoint);"; then
+            echo "::error::Auth patch failed! Upstream changed the http_access function. Update your regex."
+            exit 1
+          fi
+
+          # Check if the push trigger for master still exists
+          if ! grep -q "      - master" ".github/workflows/packaging.yml"; then
+            echo "::error::Trigger patch failed! Upstream changed the push: branches."
+            exit 1
+          fi
+
+          if ! grep -q "sudo apt-get install -y python3-ruamel\.yaml" ".github/workflows/packaging.yml"; then
+            echo "::error::Dependency patch failed! Upstream changed the apt-get install line."
+            exit 1
+          fi
+
+          if ! grep -q 'echo "Generated matrix: ${matrix}"' ".github/workflows/packaging.yml"; then
+            echo "::error::Matrix patch failed! Upstream changed the matrix generation script."
+            exit 1
+          fi
+
+          # Bypass Netdata Cloud
+          sed -i '/static inline bool http_access_user_has_enough_access_level_for_endpoint/,/}/ s/[ \t]*return ((user & endpoint) == endpoint);/    return true;/' "src/web/api/http_auth.h"
+
+          # Add the feature branch to the push triggers
+          sed -i "s|      - master|      - master\n      - ${FEATURE_BRANCH}|" ".github/workflows/packaging.yml"
+
+          # Append jq to the installation list
+          sed -i 's/sudo apt-get install -y python3-ruamel\.yaml/& jq/' ".github/workflows/packaging.yml"
+
+          # Inject the jq filter right before the echo statement
+          sed -i "s@^\([ \t]*\)echo \"Generated matrix: \${matrix}\"@\1matrix=\$(echo \"\${matrix}\" | jq -c '{include: [.include[] | select((.distro == \"fedora\" and .arch == \"x86_64\") or (.distro == \"debian\" and .arch == \"arm64\" ))]}')\n\1echo \"Generated matrix: \${matrix}\"@" ".github/workflows/packaging.yml"
+
+          # Nice-to-have, non-core logic
+          # Delete all Failure Notification steps (Slack)
+          sed -i '/- name: Failure Notification/,/^[ \t]*}}/d' ".github/workflows/packaging.yml"
+
+          # Delete the 'prepare-topology-ip-intel-stock' job
+          sed -i '/^  prepare-topology-ip-intel-stock:/,/^  build:/ { /^  build:/!d }' ".github/workflows/packaging.yml"
+
+          # Delete the 'build' job dependency
+          sed -i '/^  build:/,/^[ \t]*steps:/ { /- prepare-topology-ip-intel-stock/d }' ".github/workflows/packaging.yml"
+
+          # Delete the 'Download topology-ip-intel stock payload' step
+          sed -i '/- name: Download topology-ip-intel stock payload/,/- name: Build Packages/ { /- name: Build Packages/!d }' ".github/workflows/packaging.yml"
+
+          # Remove Topology ENV var from docker run command
+          sed -i '/-e NETDATA_TOPOLOGY_IP_INTEL_STOCK_DIR/d' ".github/workflows/packaging.yml"
+
+          # Delete 'Set Sentry telemetry env vars' step
+          sed -i '/- name: Set Sentry telemetry env vars/,/- name: Setup QEMU/ { /- name: Setup QEMU/!d }' ".github/workflows/packaging.yml"
+
+          # Clean up Sentry ENV vars from docker run command using Regex dots to hide from the GitHub Parser
+          sed -i 's/-e ENABLE_SENTRY=... matrix.bundle_sentry ..//g' ".github/workflows/packaging.yml"
+          sed -i 's/-e RELEASE_PIPELINE=... env.RELEASE_PIPELINE ..//g' ".github/workflows/packaging.yml"
+          sed -i 's/-e UPLOAD_SENTRY=... env.UPLOAD_SENTRY ..//g' ".github/workflows/packaging.yml"
+          sed -i '/-e SENTRY_AUTH_TOKEN/d' ".github/workflows/packaging.yml"
+
+          # Delete GPG Key Import
+          sed -i '/- name: Import GPG Keys/,/gpg_private_key:/d' ".github/workflows/packaging.yml"
+
+          # Delete DEB Package Signing
+          sed -i '/- name: Sign DEB Packages/,/run: \.github\/scripts\/deb-sign\.sh/d' ".github/workflows/packaging.yml"
+
+          # Delete SSH Setup for package publishing
+          sed -i '/- name: SSH setup/,/known_hosts:/d' ".github/workflows/packaging.yml"
+
+          # Delete Upload to packages.netdata.cloud
+          sed -i '/- name: Upload to packages\.netdata\.cloud/,/needs\.version-check\.outputs\.repo/d' ".github/workflows/packaging.yml"
+
+          # Delete Upload to packages2.netdata.cloud
+          sed -i '/- name: Upload to packages2\.netdata\.cloud/,/needs\.version-check\.outputs\.repo/d' ".github/workflows/packaging.yml"
+
+          # Commit and push to remote feature branch
+          git add "src/web/api/http_auth.h" ".github/workflows/packaging.yml"
+          git commit -m "feature: bypass Netdata Cloud when accessing advanced features"
+          git push origin $FEATURE_BRANCH --force-with-lease
