@@ -39,7 +39,7 @@ static struct proc_module {
      .func = do_GetPowerSupply,
      .rd = NULL,
      .thread = NULL,
-     .cleanup = NULL},
+     .cleanup = do_GetPowerSupply_cleanup},
     {.name = "GetSensors",
      .dim = "GetSensors",
      .enabled = CONFIG_BOOLEAN_YES,
@@ -50,7 +50,7 @@ static struct proc_module {
      .cleanup = do_Sensors_cleanup},
     {.name = "GetHardwareInfo",
      .dim = "GetHardwareInfo",
-     .enabled = CONFIG_BOOLEAN_NO,
+     .enabled = CONFIG_BOOLEAN_YES,
      .update_every = 10 * UPDATE_EVERY_MIN,
      .func = do_GetHardwareInfo,
      .rd = NULL,
@@ -60,11 +60,14 @@ static struct proc_module {
      .dim = "PerflibServices",
      .enabled = CONFIG_BOOLEAN_YES,
      .update_every = 30 * UPDATE_EVERY_MIN,
-     .func = do_GetServicesStatus},
+     .func = do_GetServicesStatus,
+     .rd = NULL,
+     .thread = NULL,
+     .cleanup = do_GetServicesStatus_cleanup},
 
     // the same is provided by PerflibProcessor, with more detailed analysis
     //{.name = "GetSystemCPU",        .dim = "GetSystemCPU",       .enabled = CONFIG_BOOLEAN_YES,
-    // .update_every = UPDATE_EVERY_MIN, .func = do_GetSystemCPU},
+    // .update_every = UPDATE_EVERY_MIN, .func = do_GetSystemCPU, .cleanup = do_GetSystemCPU_cleanup},
 
     {.name = "PerflibProcesses",
      .dim = "PerflibProcesses",
@@ -138,14 +141,6 @@ static struct proc_module {
      .rd = NULL,
      .thread = NULL,
      .cleanup = NULL},
-    {.name = "PerflibMSSQL",
-     .dim = "PerflibMSSQL",
-     .enabled = CONFIG_BOOLEAN_YES,
-     .update_every = 10 * UPDATE_EVERY_MIN,
-     .func = do_PerflibMSSQL,
-     .rd = NULL,
-     .thread = NULL,
-     .cleanup = do_PerflibMSSQL_cleanup},
     {.name = "PerflibNetFramework",
      .dim = "PerflibNetFramework",
      .enabled = CONFIG_BOOLEAN_YES,
@@ -331,11 +326,13 @@ void win_plugin_main(void *ptr)
     // Join threads
     for (i = 0; win_modules[i].name; i++) {
         struct proc_module *pm = &win_modules[i];
-        if (pm->cleanup)
-            pm->cleanup();
 
         if (pm->thread) {
             nd_thread_join(pm->thread);
+            pm->thread = NULL;
         }
+
+        if (pm->cleanup)
+            pm->cleanup();
     }
 }

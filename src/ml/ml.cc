@@ -168,8 +168,15 @@ const char *db_models_add_model =
     "    @c10, @c11, @c12, @c13, @c14, @c15);";
 
 const char *db_models_load =
-    "SELECT * FROM models "
-    "WHERE dim_id = @dim_id AND after >= @after ORDER BY before ASC;";
+    "SELECT after, before, min_dist, max_dist, "
+    "c00, c01, c02, c03, c04, c05, "
+    "c10, c11, c12, c13, c14, c15 FROM ("
+    "SELECT after, before, min_dist, max_dist, "
+    "c00, c01, c02, c03, c04, c05, "
+    "c10, c11, c12, c13, c14, c15 FROM models "
+    "WHERE dim_id = @dim_id AND after >= @after "
+    "ORDER BY after DESC LIMIT @n"
+    ") ORDER BY after ASC;";
 
 const char *db_models_delete =
     "DELETE FROM models "
@@ -401,35 +408,39 @@ int ml_dimension_load_models(RRDDIM *rd, sqlite3_stmt **active_stmt) {
     if (unlikely(rc != SQLITE_OK))
         goto bind_fail;
 
+    rc = sqlite3_bind_int64(res, ++param, Cfg.num_models_to_use);
+    if (unlikely(rc != SQLITE_OK))
+        goto bind_fail;
+
     spinlock_lock(&dim->slock);
 
     dim->km_contexts.reserve(Cfg.num_models_to_use);
     while ((rc = sqlite3_step_monitored(res)) == SQLITE_ROW) {
         ml_kmeans_t km;
 
-        km.after = sqlite3_column_int(res, 2);
-        km.before = sqlite3_column_int(res, 3);
+        km.after = sqlite3_column_int(res, 0);
+        km.before = sqlite3_column_int(res, 1);
 
-        km.min_dist = sqlite3_column_int(res, 4);
-        km.max_dist = sqlite3_column_int(res, 5);
+        km.min_dist = sqlite3_column_double(res, 2);
+        km.max_dist = sqlite3_column_double(res, 3);
 
         km.cluster_centers.resize(2);
 
         km.cluster_centers[0].set_size(Cfg.lag_n + 1);
-        km.cluster_centers[0](0) = sqlite3_column_double(res, 6);
-        km.cluster_centers[0](1) = sqlite3_column_double(res, 7);
-        km.cluster_centers[0](2) = sqlite3_column_double(res, 8);
-        km.cluster_centers[0](3) = sqlite3_column_double(res, 9);
-        km.cluster_centers[0](4) = sqlite3_column_double(res, 10);
-        km.cluster_centers[0](5) = sqlite3_column_double(res, 11);
+        km.cluster_centers[0](0) = sqlite3_column_double(res, 4);
+        km.cluster_centers[0](1) = sqlite3_column_double(res, 5);
+        km.cluster_centers[0](2) = sqlite3_column_double(res, 6);
+        km.cluster_centers[0](3) = sqlite3_column_double(res, 7);
+        km.cluster_centers[0](4) = sqlite3_column_double(res, 8);
+        km.cluster_centers[0](5) = sqlite3_column_double(res, 9);
 
         km.cluster_centers[1].set_size(Cfg.lag_n + 1);
-        km.cluster_centers[1](0) = sqlite3_column_double(res, 12);
-        km.cluster_centers[1](1) = sqlite3_column_double(res, 13);
-        km.cluster_centers[1](2) = sqlite3_column_double(res, 14);
-        km.cluster_centers[1](3) = sqlite3_column_double(res, 15);
-        km.cluster_centers[1](4) = sqlite3_column_double(res, 16);
-        km.cluster_centers[1](5) = sqlite3_column_double(res, 17);
+        km.cluster_centers[1](0) = sqlite3_column_double(res, 10);
+        km.cluster_centers[1](1) = sqlite3_column_double(res, 11);
+        km.cluster_centers[1](2) = sqlite3_column_double(res, 12);
+        km.cluster_centers[1](3) = sqlite3_column_double(res, 13);
+        km.cluster_centers[1](4) = sqlite3_column_double(res, 14);
+        km.cluster_centers[1](5) = sqlite3_column_double(res, 15);
 
         dim->km_contexts.emplace_back(km);
     }
@@ -618,6 +629,13 @@ static void ml_dimension_update_models(ml_worker_t *worker, ml_dimension_t *dim)
 
     spinlock_lock(&dim->slock);
 
+    ml_host_t *host = (ml_host_t *) dim->rd->rrdset->rrdhost->ml_host;
+    if (!host || !host->ml_running) {
+        dim->training_in_progress = false;
+        spinlock_unlock(&dim->slock);
+        return;
+    }
+
     if (dim->km_contexts.size() < Cfg.num_models_to_use) {
         dim->km_contexts.emplace_back(dim->kmeans);
     } else {
@@ -747,9 +765,14 @@ ml_dimension_predict(ml_dimension_t *dim, calculated_number_t value, bool exists
     if (dim->mls != MACHINE_LEARNING_STATUS_ENABLED)
         return false;
 
+    // Acquire lock to protect dim->cns from concurrent access by ml_host_stop()
+    if (spinlock_trylock(&dim->slock) == 0)
+        return false;
+
     // Don't treat values that don't exist as anomalous
     if (!exists) {
         dim->cns.clear();
+        spinlock_unlock(&dim->slock);
         return false;
     }
 
@@ -757,6 +780,7 @@ ml_dimension_predict(ml_dimension_t *dim, calculated_number_t value, bool exists
     unsigned n = Cfg.diff_n + Cfg.max_samples_to_smooth + Cfg.lag_n;
     if (dim->cns.size() < n) {
         dim->cns.push_back(value);
+        spinlock_unlock(&dim->slock);
         return false;
     }
 
@@ -784,12 +808,6 @@ ml_dimension_predict(ml_dimension_t *dim, calculated_number_t value, bool exists
         dim->feature
     };
     ml_features_preprocess(&features, 1.0);
-
-    /*
-     * Lock to predict
-    */
-    if (spinlock_trylock(&dim->slock) == 0)
-        return false;
 
     // Mark the metric time as variable if we received different values
     if (!same_value)
@@ -1131,6 +1149,8 @@ static enum ml_worker_result ml_worker_add_existing_model(ml_worker_t *worker, m
     }
     spinlock_unlock(&Dim->slock);
 
+    // Safe without Dim->slock: per-host work is serialized through a single worker queue,
+    // and stop/reset no longer writes Dim->kmeans from non-worker threads.
     Dim->kmeans = req.inlined_km;
     ml_dimension_update_models(worker, Dim);
     pulse_ml_models_received();

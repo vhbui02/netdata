@@ -218,6 +218,8 @@ USAGE: ${PROGRAM} [options]
   --internal-systemd-journal Enable the internal journal file reader instead of using libsystemd
   --enable-plugin-otel Enable the Netdata OpenTelemetry plugin. Default: disabled
   --disable-plugin-otel Explicitly disable the Netdata OpenTelemetry plugin.
+  --enable-plugin-otel-signal-viewer Enable the OTel signal viewer plugin. Default: disabled
+  --disable-plugin-otel-signal-viewer Explicitly disable the OTel signal viewer plugin.
   --enable-plugin-ibm        Enable the IBM ecosystem monitoring plugin. Default: disabled
   --disable-plugin-ibm       Explicitly disable the IBM ecosystem monitoring plugin.
   --enable-exporting-kinesis Enable AWS Kinesis exporting connector. Default: enable it when libaws_cpp_sdk_kinesis
@@ -262,7 +264,9 @@ ENABLE_GO=1
 ENABLE_PYTHON=1
 ENABLE_CHARTS=1
 ENABLE_OTEL=0
+ENABLE_OTEL_SIGNAL_VIEWER=0
 ENABLE_IBM=0
+ENABLE_SCRIPTS=0
 FORCE_LEGACY_CXX=0
 NETDATA_CMAKE_OPTIONS="${NETDATA_CMAKE_OPTIONS-}"
 REMOVE_BUILD=1
@@ -304,8 +308,12 @@ while [ -n "${1}" ]; do
     "--internal-systemd-journal") USE_RUST_JOURNAL_FILE=1 ;;
     "--enable-plugin-otel") ENABLE_OTEL=1 ;;
     "--disable-plugin-otel") ENABLE_OTEL=0 ;;
+    "--enable-plugin-otel-signal-viewer") ENABLE_OTEL_SIGNAL_VIEWER=1 ;;
+    "--disable-plugin-otel-signal-viewer") ENABLE_OTEL_SIGNAL_VIEWER=0 ;;
     "--enable-plugin-ibm") ENABLE_IBM=1 ;;
     "--disable-plugin-ibm") ENABLE_IBM=0 ;;
+    "--enable-plugin-scripts") ENABLE_SCRIPTS=1 ;;
+    "--disable-plugin-scripts") ENABLE_SCRIPTS=0 ;;
     "--enable-exporting-kinesis" | "--enable-backend-kinesis")
       # TODO: Needs CMake Support
       ;;
@@ -549,14 +557,21 @@ fi
 trap build_error EXIT
 
 # -----------------------------------------------------------------------------
-# If we’re installing the Go plugin, ensure a working Go toolchain is installed.
-if [ "${ENABLE_GO}" -eq 1 ]; then
+# If we’re building any Go-based component, ensure a working Go toolchain exists.
+NEED_GO_TOOLCHAIN=0
+if [ "${ENABLE_GO}" -eq 1 ] || [ "${ENABLE_IBM}" -eq 1 ] || [ "${ENABLE_SCRIPTS}" -eq 1 ]; then
+  NEED_GO_TOOLCHAIN=1
+fi
+
+if [ "${NEED_GO_TOOLCHAIN}" -eq 1 ]; then
   progress "Checking for a usable Go toolchain and attempting to install one to /usr/local/go if needed."
   . "${NETDATA_SOURCE_DIR}/packaging/check-for-go-toolchain.sh"
 
   if ! ensure_go_toolchain; then
-    warning "Go ${GOLANG_MIN_VERSION} needed to build Go plugin, but could not find or install a usable toolchain: ${GOLANG_FAILURE_REASON}"
+    warning "Go ${GOLANG_MIN_VERSION} needed to build Go-based plugins (go.d, scripts.d, IBM), but could not find or install a usable toolchain: ${GOLANG_FAILURE_REASON}. Disabling those components."
     ENABLE_GO=0
+    ENABLE_IBM=0
+    ENABLE_SCRIPTS=0
   fi
 fi
 
@@ -831,6 +846,21 @@ if [ "$(id -u)" -eq 0 ]; then
 
     if [ $capabilities -eq 0 ]; then
       run chmod 4750 "${NETDATA_PREFIX}/usr/libexec/netdata/plugins.d/systemd-journal.plugin"
+    fi
+  fi
+
+  if [ -f "${NETDATA_PREFIX}/usr/libexec/netdata/plugins.d/otel-signal-viewer-plugin" ]; then
+    run chown "root:${NETDATA_GROUP}" "${NETDATA_PREFIX}/usr/libexec/netdata/plugins.d/otel-signal-viewer-plugin"
+    capabilities=0
+    if ! iscontainer && command -v setcap 1> /dev/null 2>&1; then
+      run chmod 0750 "${NETDATA_PREFIX}/usr/libexec/netdata/plugins.d/otel-signal-viewer-plugin"
+      if run setcap cap_dac_read_search+ep "${NETDATA_PREFIX}/usr/libexec/netdata/plugins.d/otel-signal-viewer-plugin"; then
+        capabilities=1
+      fi
+    fi
+
+    if [ $capabilities -eq 0 ]; then
+      run chmod 4750 "${NETDATA_PREFIX}/usr/libexec/netdata/plugins.d/otel-signal-viewer-plugin"
     fi
   fi
 

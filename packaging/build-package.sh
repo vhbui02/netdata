@@ -37,6 +37,7 @@ add_cmake_option ENABLE_PLUGIN_CGROUP_NETWORK On
 add_cmake_option ENABLE_PLUGIN_DEBUGFS On
 add_cmake_option ENABLE_PLUGIN_FREEIPMI On
 add_cmake_option ENABLE_PLUGIN_GO On
+add_cmake_option ENABLE_PLUGIN_SCRIPTS On
 add_cmake_option ENABLE_PLUGIN_PYTHON On
 add_cmake_option ENABLE_PLUGIN_CHARTS On
 add_cmake_option ENABLE_PLUGIN_LOCAL_LISTENERS On
@@ -56,6 +57,8 @@ add_cmake_option ENABLE_BUNDLED_YAML Off
 add_cmake_option ENABLE_LIBBACKTRACE On
 
 add_cmake_option BUILD_FOR_PACKAGING On
+
+[ -d "${SOURCE_DIR}/tmp/ibm_mq" ] && add_cmake_option FETCHCONTENT_SOURCE_DIR_IBM_MQ "${SOURCE_DIR}/tmp/ibm_mq"
 
 case "${PKG_TYPE}" in
     DEB)

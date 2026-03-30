@@ -3,6 +3,9 @@
   "update_every": 123,
   "autodetection_retry": 123,
   "dsn": "ok",
+  "cloud_auth": {
+    "provider": "none"
+  },
   "timeout": 123.123,
   "collect_databases_matching": "ok",
   "transaction_time_histogram": [
@@ -12,5 +15,12 @@
     123.123
   ],
   "max_db_tables": 123,
-  "max_db_indexes": 123
+  "max_db_indexes": 123,
+  "functions": {
+    "top_queries": {
+      "disabled": true,
+      "timeout": 123.123,
+      "limit": 123
+    }
+  }
 }

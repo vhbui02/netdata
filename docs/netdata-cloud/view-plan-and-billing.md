@@ -37,6 +37,12 @@ You can change your plan, billing frequency, or committed nodes at any time. For
 
 :::
 
+:::note Cancellation
+
+Subscription cancellations do not take effect immediately. When you submit a cancellation request, it becomes effective on your plan's next billing anniversary date. For monthly subscriptions, this is the same calendar day each month when your subscription renews. Usage up to the effective cancellation date remains billable.
+
+:::
+
 #### Areas That Change Upon Subscription
 
 Please refer to the [Netdata Cloud Pricing](https://netdata.cloud/pricing) page for more information on what each plan provides.
@@ -52,7 +58,7 @@ Please refer to the [Netdata Cloud Pricing](https://netdata.cloud/pricing) page 
 
 #### View Current Plan, Billing Options, and Invoices
 
-1. Navigate to **Space settings** (the cog above your profile icon).
+1. Navigate to **Space Settings** (⚙️) on the left sidebar below the spaces list.
 2. Select the **Plan & Billing** tab.
 3. You'll see:
     - **Credit** amount, if applicable, usable for future invoices or subscription changes. More on this at [Plan changes and credit balance](/docs/netdata-cloud/view-plan-and-billing.md#plan-changes-and-credit-balance).

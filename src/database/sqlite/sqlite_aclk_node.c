@@ -5,6 +5,7 @@
 
 #include "../../aclk/aclk_contexts_api.h"
 #include "../../aclk/aclk_capas.h"
+#include "../../aclk/aclk_query_queue.h"
 
 DICTIONARY *collectors_from_charts(RRDHOST *host, DICTIONARY *dict) {
     RRDSET *st;
@@ -44,7 +45,7 @@ static void build_node_collectors(RRDHOST *host)
         aclk_host_config->node_id, rrdhost_hostname(host));
 }
 
-static void build_node_info(RRDHOST *host)
+static void build_node_info(RRDHOST *host, struct aclk_sync_completion *sync_completion)
 {
     struct update_node_info node_info;
 
@@ -70,11 +71,13 @@ static void build_node_info(RRDHOST *host)
     if (host != localhost && !is_virtual_host)
         host_version = stream_receiver_program_version_strdupz(host);
 
+    RRDHOST_TZ host_tz = rrdhost_tz_get(host);
+
     node_info.data.name = rrdhost_hostname(host);
     node_info.data.os = rrdhost_os(host);
     node_info.data.version = host_version ? host_version : NETDATA_VERSION;
     node_info.data.release_channel = get_release_channel();
-    node_info.data.timezone = rrdhost_abbrev_timezone(host);
+    node_info.data.timezone = host_tz.abbrev_timezone;
     node_info.data.custom_info = inicfg_get(&netdata_config, CONFIG_SECTION_WEB, "custom dashboard_info.js", "");
     node_info.data.machine_guid = host->machine_guid;
     node_info.node_capabilities = (struct capability *)aclk_get_agent_capas();
@@ -82,7 +85,7 @@ static void build_node_info(RRDHOST *host)
 
     rrdhost_system_info_to_node_info(host->system_info, &node_info);
 
-    aclk_update_node_info(&node_info);
+    aclk_update_node_info(&node_info, sync_completion);
     nd_log(
         NDLS_ACCESS,
         NDLP_DEBUG,
@@ -93,10 +96,61 @@ static void build_node_info(RRDHOST *host)
         host == localhost ? "parent" : "child");
 
     rrd_rdunlock();
+    rrdhost_tz_free(&host_tz);
     freez(node_info.node_instance_capabilities);
     freez(host_version);
 
     aclk_host_config->node_collectors_send = now_realtime_sec();
+}
+
+void send_node_info_with_wait(RRDHOST *host)
+{
+    if (unlikely(!host || !__atomic_load_n(&host->aclk_host_config, __ATOMIC_RELAXED)))
+        return;
+
+    // No node_id means cloud doesn't know about this node - nothing to update
+    if (uuid_is_null(host->node_id.uuid))
+        return;
+
+    if (!aclk_online())
+        return;
+
+    struct aclk_sync_completion *sc = aclk_sync_completion_create();
+
+    build_node_info(host, sc);
+
+    bool success = aclk_sync_completion_timedwait(sc, 30);
+    if (!success) {
+        nd_log(NDLS_DAEMON, NDLP_WARNING,
+               "Timed out waiting for node info update for host '%s'",
+               rrdhost_hostname(host));
+    }
+    // sc is automatically freed when both waiter and query release their references
+}
+
+void send_node_update_with_wait(RRDHOST *host, int live, int queryable)
+{
+    if (unlikely(!host || !__atomic_load_n(&host->aclk_host_config, __ATOMIC_RELAXED)))
+        return;
+
+    // No node_id means cloud doesn't know about this node - nothing to update
+    if (uuid_is_null(host->node_id.uuid))
+        return;
+
+    if (!aclk_online())
+        return;
+
+    struct aclk_sync_completion *sc = aclk_sync_completion_create();
+
+    aclk_host_state_update(host, live, queryable, sc);
+
+    bool success = aclk_sync_completion_timedwait(sc, 30);
+    if (!success) {
+        nd_log(NDLS_DAEMON, NDLP_WARNING,
+               "Timed out waiting for node state update for host '%s'",
+               rrdhost_hostname(host));
+    }
+    // sc is automatically freed when both waiter and query release their references
 }
 
 void aclk_check_node_info_and_collectors(void)
@@ -166,7 +220,7 @@ void aclk_check_node_info_and_collectors(void)
         if (pp_queue_empty && aclk_host_config->node_info_send_time &&
             aclk_host_config->node_info_send_time + 30 < now) {
             aclk_host_config->node_info_send_time = 0;
-            build_node_info(host);
+            build_node_info(host, NULL);
             schedule_node_state_update(host, 10000);
             internal_error(true, "ACLK SYNC: Sending node info for %s", rrdhost_hostname(host));
         }

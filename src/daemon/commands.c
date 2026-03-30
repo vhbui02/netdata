@@ -33,6 +33,14 @@ struct command_context {
     unsigned command_string_size;
 };
 
+static inline char command_reply_prefix(const struct command_context *cmd_ctx, cmd_status_t status)
+{
+    if (cmd_ctx->idx == CMD_PING)
+        return CMD_PREFIX_INFO;
+
+    return cmd_prefix_by_status[status];
+}
+
 /* Forward declarations */
 static cmd_status_t cmd_help_execute(char *args, char **message);
 static cmd_status_t cmd_reload_health_execute(char *args, char **message);
@@ -61,7 +69,7 @@ static command_info_t command_info_array[] = {
     {"reload-labels", "", "Reload all localhost labels.", cmd_reload_labels_execute, CMD_TYPE_ORTHOGONAL, CMD_INIT_STATUS_FULL},                 // reload the labels
     {"read-config", "", "", cmd_read_config_execute, CMD_TYPE_CONCURRENT, CMD_INIT_STATUS_FULL},
     {"write-config", "", "", cmd_write_config_execute, CMD_TYPE_ORTHOGONAL, CMD_INIT_STATUS_FULL},
-    {"ping", "", "Return with 'pong' if agent is alive.", cmd_ping_execute, CMD_TYPE_ORTHOGONAL, CMD_INIT_STATUS_INIT},                       // ping command
+    {"ping", "", "Return with 'pong'; exit 0 when ready, 1 while initializing, 255 if the agent cannot be contacted.", cmd_ping_execute, CMD_TYPE_ORTHOGONAL, CMD_INIT_STATUS_INIT},     // ping command
     {"aclk-state", "[json]",  "Returns current state of ACLK and Netdata Cloud connection. (optionally in json).", cmd_aclk_state, CMD_TYPE_ORTHOGONAL, CMD_INIT_STATUS_FULL},
     {"version", "", "Returns the netdata version.", cmd_version, CMD_TYPE_ORTHOGONAL, CMD_INIT_STATUS_INIT},
     {"dumpconfig", "", "Returns the current netdata.conf on stdout.", cmd_dumpconfig, CMD_TYPE_ORTHOGONAL, CMD_INIT_STATUS_FULL},
@@ -309,7 +317,7 @@ static cmd_status_t cmd_ping_execute(char *args, char **message)
 
     *message = strdupz("pong");
 
-    return CMD_STATUS_SUCCESS;
+    return netdata_ready_load() ? CMD_STATUS_SUCCESS : CMD_STATUS_FAILURE;
 }
 
 static cmd_status_t cmd_aclk_state(char *args, char **message)
@@ -371,8 +379,12 @@ static int remove_ephemeral_host(BUFFER *wb, RRDHOST *host, bool report_error, b
     sql_set_host_label(&host->host_id.uuid, "_is_ephemeral", "true");
     pulse_host_status(host, 0, 0);
 
-    if(unregister) {
-        aclk_host_state_update(host, 0, 0);
+    if (marked)
+        send_node_info_with_wait(host);
+
+    if (unregister) {
+        send_node_update_with_wait(host, 0, 0);
+
         unregister_node(host->machine_guid);
         host->node_id = UUID_ZERO;
         buffer_sprintf(wb, "Node '%s' (machine guid: %s) has been unregistered",
@@ -382,12 +394,14 @@ static int remove_ephemeral_host(BUFFER *wb, RRDHOST *host, bool report_error, b
         rrd_wrunlock();
         return 1;
     }
-    else if(marked) {
+
+    if (marked) {
         buffer_sprintf(wb, "Node '%s' (machine guid: %s) has been marked ephemeral",
                        rrdhost_hostname(host), host->machine_guid);
         return 1;
     }
-    else if (report_error) {
+
+    if (report_error) {
         buffer_sprintf(wb, "Node '%s' (machine guid: %s) is already ephemeral - not changing it",
                        rrdhost_hostname(host), host->machine_guid);
     }
@@ -579,7 +593,7 @@ static void send_command_reply(struct command_context *cmd_ctx, cmd_status_t sta
     add_char_to_command_reply(reply_string, &reply_string_size, '\0');
 
     if (message) {
-        add_char_to_command_reply(reply_string, &reply_string_size, cmd_prefix_by_status[status]);
+        add_char_to_command_reply(reply_string, &reply_string_size, command_reply_prefix(cmd_ctx, status));
         add_string_to_command_reply(reply_string, &reply_string_size, message);
     }
 
@@ -721,6 +735,7 @@ static void connection_cb(uv_stream_t *server, int status)
 
     /* combined allocation of client pipe and command context */
     cmd_ctx = mallocz(sizeof(*cmd_ctx));
+    cmd_ctx->idx = CMD_HELP;
     client = (uv_pipe_t *)cmd_ctx;
     ret = uv_pipe_init(server->loop, client, 1);
     if (ret) {
