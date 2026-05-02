@@ -17,10 +17,11 @@ type collectorRuntime struct {
 }
 
 type profileRuntime struct {
-	ID              string
 	Name            string
+	DisplayName     string
 	ResourceType    string
 	MetricNamespace string
+	Filters         *ResourceFiltersConfig
 	Metrics         []*metricRuntime
 	Template        charttpl.Group
 }
@@ -60,21 +61,34 @@ func (i *instrumentRuntime) observe(labelValues []string, value float64) {
 type discoveryState struct {
 	Resources    []resourceInfo
 	ByType       map[string][]resourceInfo
+	ByProfile    map[string][]resourceInfo
 	ExpiresAt    time.Time
 	FetchedAt    time.Time
 	FetchCounter uint64
 }
 
+type resourceTag struct {
+	Key   string
+	Value string
+}
+
 type resourceInfo struct {
-	ID            string
-	UID           string
-	Name          string
-	Type          string
-	ResourceGroup string
-	Region        string
+	SubscriptionID string
+	ID             string
+	UID            string
+	Name           string
+	Type           string
+	ResourceGroup  string
+	Region         string
+	Tags           []resourceTag
+}
+
+func (r resourceInfo) String() string {
+	return r.Name + " (" + r.Type + ")"
 }
 
 type queryBatch struct {
+	SubscriptionID string
 	Profile        *profileRuntime
 	Metrics        []*metricRuntime
 	MetricNames    []string

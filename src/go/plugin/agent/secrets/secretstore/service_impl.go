@@ -5,7 +5,8 @@ package secretstore
 import (
 	"context"
 	"fmt"
-	"sort"
+	"maps"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -135,12 +136,12 @@ func (s *inMemoryService) GetStatus(key string) (StoreStatus, bool) {
 	return cloneStoreStatus(record.status), true
 }
 
-func (s *inMemoryService) Validate(cfg Config) error {
-	_, err := s.prepareConfig(context.Background(), cfg)
+func (s *inMemoryService) Validate(ctx context.Context, cfg Config) error {
+	_, err := s.prepareConfig(ctx, cfg)
 	return err
 }
 
-func (s *inMemoryService) ValidateStored(key string) error {
+func (s *inMemoryService) ValidateStored(ctx context.Context, key string) error {
 	key, err := normalizeStoreKey(key)
 	if err != nil {
 		return err
@@ -156,7 +157,7 @@ func (s *inMemoryService) ValidateStored(key string) error {
 	}
 	validatedHash := record.configHash
 
-	_, err = s.prepareConfig(context.Background(), record.rawConfig)
+	_, err = s.prepareConfig(ctx, record.rawConfig)
 
 	validation := &ValidationStatus{
 		CheckedAt: s.now().UTC(),
@@ -194,8 +195,8 @@ func (s *inMemoryService) ValidateStored(key string) error {
 	return err
 }
 
-func (s *inMemoryService) Add(cfg Config) error {
-	prepared, err := s.prepareConfig(context.Background(), cfg)
+func (s *inMemoryService) Add(ctx context.Context, cfg Config) error {
+	prepared, err := s.prepareConfig(ctx, cfg)
 	if err != nil {
 		return err
 	}
@@ -221,7 +222,7 @@ func (s *inMemoryService) Add(cfg Config) error {
 	return nil
 }
 
-func (s *inMemoryService) Update(key string, cfg Config) error {
+func (s *inMemoryService) Update(ctx context.Context, key string, cfg Config) error {
 	key, err := normalizeStoreKey(key)
 	if err != nil {
 		return err
@@ -236,7 +237,7 @@ func (s *inMemoryService) Update(key string, cfg Config) error {
 		return storeNotConfiguredError(key)
 	}
 
-	prepared, err := s.prepareConfig(context.Background(), cfg)
+	prepared, err := s.prepareConfig(ctx, cfg)
 	if err != nil {
 		return err
 	}
@@ -305,7 +306,7 @@ func newCreatorRegistry(creators ...Creator) creatorRegistry {
 	for kind := range reg.byKind {
 		reg.kinds = append(reg.kinds, kind)
 	}
-	sort.Slice(reg.kinds, func(i, j int) bool { return reg.kinds[i] < reg.kinds[j] })
+	slices.Sort(reg.kinds)
 	return reg
 }
 
@@ -322,6 +323,12 @@ func (s *inMemoryService) prepareConfig(ctx context.Context, cfg Config) (prepar
 		return preparedStore{}, fmt.Errorf("store config is nil")
 	}
 	if err := raw.Validate(); err != nil {
+		return preparedStore{}, err
+	}
+	rawConfig := cloneConfig(raw)
+	rawHash := raw.Hash()
+	resolvedPayload, err := resolveProviderPayload(ctx, raw)
+	if err != nil {
 		return preparedStore{}, err
 	}
 
@@ -341,6 +348,13 @@ func (s *inMemoryService) prepareConfig(ctx context.Context, cfg Config) (prepar
 	if err != nil {
 		return preparedStore{}, fmt.Errorf("store '%s': marshaling raw config: %w", key, err)
 	}
+	if len(resolvedPayload) != 0 {
+		maps.Copy(raw, resolvedPayload)
+		bs, err = yaml.Marshal(raw)
+		if err != nil {
+			return preparedStore{}, fmt.Errorf("store '%s': marshaling resolved config: %w", key, err)
+		}
+	}
 	if err := yaml.Unmarshal(bs, store.Configuration()); err != nil {
 		return preparedStore{}, fmt.Errorf("store '%s': invalid provider payload: %w", key, err)
 	}
@@ -356,8 +370,8 @@ func (s *inMemoryService) prepareConfig(ctx context.Context, cfg Config) (prepar
 
 	return preparedStore{
 		key:        key,
-		rawConfig:  raw,
-		configHash: raw.Hash(),
+		rawConfig:  rawConfig,
+		configHash: rawHash,
 		status: StoreStatus{
 			Name: name,
 			Kind: kind,

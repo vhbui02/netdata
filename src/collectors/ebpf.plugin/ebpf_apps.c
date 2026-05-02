@@ -829,10 +829,12 @@ void ebpf_del_pid_entry(pid_t pid)
 static void ebpf_cleanup_exited_pids()
 {
     ebpf_pid_data_t *p = NULL;
-    for (p = ebpf_pids_link_list; p; p = p->next) {
+    for (p = ebpf_pids_link_list; p;) {
+        ebpf_pid_data_t *next = p->next;
         if (!p->has_proc_file) {
             ebpf_reset_specific_pid_data(p);
         }
+        p = next;
     }
 }
 
@@ -912,7 +914,7 @@ void ebpf_parse_proc_files()
         if (ebpf_plugin_stop())
             break;
 
-        if (kill(pids->pid, 0)) { // No PID found
+        if (kill(pids->pid, 0) == -1 && errno == ESRCH) {
             ebpf_pid_data_t *next = pids->next;
             ebpf_reset_specific_pid_data(pids);
             pids = next;

@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/netdata/netdata/go/plugins/logger"
-	"github.com/netdata/netdata/go/plugins/plugin/agent/secrets/secretstore"
 	"github.com/netdata/netdata/go/plugins/plugin/framework/collectorapi"
 	"github.com/netdata/netdata/go/plugins/plugin/framework/confgroup"
 	"github.com/netdata/netdata/go/plugins/plugin/framework/dyncfg"
@@ -115,7 +114,7 @@ func (m *Manager) dyncfgCmdTest(fn dyncfg.Function) {
 
 	m.Infof("dyncfg: %s: %s/%s job by user '%s'", cmd, mn, jn, fn.User())
 
-	if err := dyncfg.ValidateJobName(jn); err != nil {
+	if err := dyncfg.JobNameRuleStrict(jn); err != nil {
 		m.Warningf("dyncfg: %s: module %s: unacceptable job name '%s': %v", cmd, mn, jn, err)
 		m.dyncfgResponder.SendCodef(fn, 400, "Unacceptable job name '%s': %v.", jn, err)
 		return
@@ -185,13 +184,10 @@ func (m *Manager) runDyncfgCmdTest(task dyncfgCmdTestTask) {
 	defer cancel()
 
 	secretStoreSvc := m.secretsCtl.Service()
-
-	storeSnapshot := (*secretstore.Snapshot)(nil)
-	if secretStoreSvc != nil {
-		storeSnapshot = secretStoreSvc.Capture()
-	}
-	if err := applyConfig(ctx, task.cfg, job, m.secretResolver, secretStoreSvc, storeSnapshot); err != nil {
-		m.Warningf("dyncfg: test: module %s: failed to apply config: %v", task.moduleName, err)
+	storeSnapshot := secretStoreSvc.Capture()
+	resolveCtx := collectorSecretResolveContext(ctx, m.Logger, task.cfg)
+	if err := applyConfig(resolveCtx, task.cfg, job, m.secretResolver, secretStoreSvc, storeSnapshot); err != nil {
+		m.Warningf("dyncfg: test: module %s job %s: failed to apply config: %v", task.moduleName, task.cfg.Name(), err)
 		m.dyncfgResponder.SendCodef(task.fn, 400, "Invalid configuration. Failed to apply configuration: %v.", err)
 		return
 	}

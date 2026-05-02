@@ -17,7 +17,6 @@ import (
 )
 
 type queryExecutor struct {
-	subscriptionID string
 	maxConcurrency int
 	timeout        time.Duration
 	cloudCfg       azcloud.Configuration
@@ -28,9 +27,8 @@ type queryExecutor struct {
 	clients   map[string]metricsQueryClient
 }
 
-func newQueryExecutor(subscriptionID string, maxConcurrency int, timeout time.Duration, credential azcore.TokenCredential, cloudCfg azcloud.Configuration, newClient func(endpoint string, cred azcore.TokenCredential, cloud azcloud.Configuration) (metricsQueryClient, error)) *queryExecutor {
+func newQueryExecutor(maxConcurrency int, timeout time.Duration, credential azcore.TokenCredential, cloudCfg azcloud.Configuration, newClient func(endpoint string, cred azcore.TokenCredential, cloud azcloud.Configuration) (metricsQueryClient, error)) *queryExecutor {
 	return &queryExecutor{
-		subscriptionID: subscriptionID,
 		maxConcurrency: maxConcurrency,
 		timeout:        timeout,
 		cloudCfg:       cloudCfg,
@@ -46,23 +44,17 @@ func (e *queryExecutor) reset() {
 	e.clients = make(map[string]metricsQueryClient)
 }
 
-func (e *queryExecutor) runQueryBatches(ctx context.Context, batches []queryBatch, queryEnd time.Time) []queryBatchResult {
-	workers := e.maxConcurrency
-	if workers < 1 {
-		workers = 1
-	}
-	if workers > len(batches) {
-		workers = len(batches)
-	}
+func (e *queryExecutor) runQueryBatches(ctx context.Context, batches []queryBatch, queryNow time.Time, queryOffsetSeconds int) []queryBatchResult {
+	workers := min(max(e.maxConcurrency, 1), len(batches))
 
 	input := make(chan queryBatch)
 	output := make(chan queryBatchResult, len(batches))
 
 	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
+	for range workers {
 		wg.Go(func() {
 			for batch := range input {
-				samples, err := e.executeQueryBatch(ctx, batch, queryEnd)
+				samples, err := e.executeQueryBatch(ctx, batch, queryNow, queryOffsetSeconds)
 				output <- queryBatchResult{Samples: samples, Err: err}
 			}
 		})
@@ -82,21 +74,21 @@ func (e *queryExecutor) runQueryBatches(ctx context.Context, batches []queryBatc
 	return results
 }
 
-func (e *queryExecutor) executeQueryBatch(ctx context.Context, batch queryBatch, queryEnd time.Time) ([]metricSample, error) {
+func (e *queryExecutor) executeQueryBatch(ctx context.Context, batch queryBatch, queryNow time.Time, queryOffsetSeconds int) ([]metricSample, error) {
 	client, err := e.getMetricsClient(batch.Region)
 	if err != nil {
 		return nil, err
 	}
 
 	resourceIDs, resourceByID := queryBatchResourceIndex(batch.Resources)
-	startTime, endTime, interval, aggregation := queryBatchWindow(batch, queryEnd)
+	startTime, endTime, interval, aggregation := queryBatchWindow(batch, queryNow, queryOffsetSeconds)
 
 	reqCtx, cancel := withOptionalTimeout(ctx, e.timeout)
 	defer cancel()
 
 	resp, err := client.QueryResources(
 		reqCtx,
-		e.subscriptionID,
+		batch.SubscriptionID,
 		batch.Profile.MetricNamespace,
 		batch.MetricNames,
 		azmetrics.ResourceIDList{ResourceIDs: resourceIDs},
@@ -111,7 +103,7 @@ func (e *queryExecutor) executeQueryBatch(ctx context.Context, batch queryBatch,
 		return nil, err
 	}
 
-	return samplesFromQueryResponse(resp.Values, batch.Profile.ID, queryBatchMetricIndex(batch.Metrics), resourceByID), nil
+	return samplesFromQueryResponse(resp.Values, batch.Profile.Name, queryBatchMetricIndex(batch.Metrics), resourceByID), nil
 }
 
 func queryBatchMetricIndex(metrics []*metricRuntime) map[string]*metricRuntime {
@@ -132,20 +124,38 @@ func queryBatchResourceIndex(resources []resourceInfo) ([]string, map[string]res
 	return resourceIDs, resourceByID
 }
 
-func queryBatchWindow(batch queryBatch, queryEnd time.Time) (string, string, string, string) {
+func queryBatchWindow(batch queryBatch, queryNow time.Time, queryOffsetSeconds int) (string, string, string, string) {
+	queryEnd := queryEndForBatch(queryNow, queryOffsetSeconds, batch.TimeGrainEvery)
 	start := queryEnd.Add(-batch.TimeGrainEvery).UTC().Format(time.RFC3339)
 	end := queryEnd.UTC().Format(time.RFC3339)
 	return start, end, batch.TimeGrain, strings.Join(batch.Aggregations, ",")
 }
 
-func samplesFromQueryResponse(metricData []azmetrics.MetricData, profileID string, metricToRuntime map[string]*metricRuntime, resourceByID map[string]resourceInfo) []metricSample {
+func queryEndForBatch(now time.Time, queryOffsetSeconds int, batchTimeGrainEvery time.Duration) time.Time {
+	offset := effectiveQueryOffset(queryOffsetSeconds, batchTimeGrainEvery)
+	queryEnd := now.Add(-offset)
+	if queryEnd.IsZero() {
+		return now
+	}
+	return queryEnd
+}
+
+func effectiveQueryOffset(queryOffsetSeconds int, batchTimeGrainEvery time.Duration) time.Duration {
+	offset := secondsToDuration(queryOffsetSeconds)
+	if batchTimeGrainEvery > offset {
+		return batchTimeGrainEvery
+	}
+	return offset
+}
+
+func samplesFromQueryResponse(metricData []azmetrics.MetricData, profileName string, metricToRuntime map[string]*metricRuntime, resourceByID map[string]resourceInfo) []metricSample {
 	samples := make([]metricSample, 0, len(metricData))
 	for _, data := range metricData {
 		resource, ok := resourceByID[stringsLowerTrim(derefOrZero(data.ResourceID))]
 		if !ok {
 			continue
 		}
-		samples = append(samples, samplesFromMetricValues(data.Values, resourceLabels(resource, profileID), metricToRuntime)...)
+		samples = append(samples, samplesFromMetricValues(data.Values, resourceLabels(resource, profileName), metricToRuntime)...)
 	}
 	return samples
 }
@@ -173,14 +183,15 @@ func samplesFromMetricValues(metrics []azmetrics.Metric, labels metrix.Labels, m
 	return samples
 }
 
-func resourceLabels(resource resourceInfo, profileID string) metrix.Labels {
+func resourceLabels(resource resourceInfo, profileName string) metrix.Labels {
 	return metrix.Labels{
-		"resource_uid":   resource.UID,
-		"resource_name":  resource.Name,
-		"resource_group": resource.ResourceGroup,
-		"region":         resource.Region,
-		"resource_type":  resource.Type,
-		"profile":        profileID,
+		"resource_uid":    resource.UID,
+		"subscription_id": resource.SubscriptionID,
+		"resource_name":   resource.Name,
+		"resource_group":  resource.ResourceGroup,
+		"region":          resource.Region,
+		"resource_type":   resource.Type,
+		"profile":         profileName,
 	}
 }
 

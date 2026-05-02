@@ -1167,29 +1167,51 @@ static time_t find_uuid_first_time(
 
     bool agent_shutdown = false;
     while (datafile) {
+        size_t journal_v2_file_size = 0;
         struct journal_v2_header *j2_header = journalfile_v2_data_acquire_with_hint(
-            datafile->journalfile, NULL, 0, 0, JOURNALFILE_V2_ACCESS_RANDOM);
+            datafile->journalfile, &journal_v2_file_size, 0, 0, JOURNALFILE_V2_ACCESS_RANDOM);
         if (!j2_header) {
             datafile = datafile_release_and_acquire_next_for_retention(ctx, datafile);
             continue;
         }
 
         bool any_matching = false;
+        bool journal_access_failed = false;
 
-        time_t journal_start_time_s = (time_t)(j2_header->start_time_ut / USEC_PER_SEC);
-
-        if (journal_start_time_s < global_first_time_s)
-            global_first_time_s = journal_start_time_s;
-
-        struct journal_metric_list *uuid_list =
-            (struct journal_metric_list *)((uint8_t *)j2_header + j2_header->metric_offset);
-        struct uuid_first_time_s *uuid_original_entry;
-
-        size_t journal_metric_count = j2_header->metric_count;
         char file_path[RRDENG_PATH_MAX];
         journalfile_v2_generate_path(datafile, file_path, sizeof(file_path));
         PROTECTED_ACCESS_SETUP(datafile->journalfile->mmap.data, datafile->journalfile->mmap.size, file_path, "read");
         if (no_signal_received) {
+            time_t journal_start_time_s = (time_t)(j2_header->start_time_ut / USEC_PER_SEC);
+
+            if (journal_start_time_s < global_first_time_s)
+                global_first_time_s = journal_start_time_s;
+
+            size_t metric_offset = j2_header->metric_offset;
+            size_t journal_metric_count = j2_header->metric_count;
+            size_t metric_list_size;
+            if (__builtin_mul_overflow(journal_metric_count, sizeof(struct journal_metric_list), &metric_list_size)) {
+                nd_log_daemon(NDLP_ERR,
+                              "DBENGINE: metric list size overflow in journalfile \"%s\" "
+                              "(metric_count=%zu, entry_size=%zu), skipping it",
+                              file_path, journal_metric_count, sizeof(struct journal_metric_list));
+                journal_access_failed = true;
+                goto release_journal;
+            }
+            if (metric_offset > journal_v2_file_size ||
+                metric_list_size > journal_v2_file_size - metric_offset) {
+                nd_log_daemon(NDLP_ERR,
+                              "DBENGINE: metric list exceeds journal file size in journalfile \"%s\" "
+                              "(metric_offset=%zu, list_size=%zu, file_size=%zu), skipping it",
+                              file_path, metric_offset, metric_list_size, journal_v2_file_size);
+                journal_access_failed = true;
+                goto release_journal;
+            }
+
+            struct journal_metric_list *uuid_list =
+                (struct journal_metric_list *)((uint8_t *)j2_header + metric_offset);
+            struct uuid_first_time_s *uuid_original_entry;
+
             size_t journal_search_start = 0; // Start of remaining search space
             any_matching = false;
             for (size_t index = 0; index < count; ++index) {
@@ -1199,6 +1221,9 @@ static time_t find_uuid_first_time(
                     continue;
 
                 any_matching = true;
+                if (journal_search_start >= journal_metric_count)
+                    break;
+
                 struct journal_metric_list *live_entry = &uuid_list[journal_search_start];
                 // Check if we avoid bsearch
                 if (journal_metric_uuid_compare(uuid_original_entry->uuid, live_entry->uuid) != 0) {
@@ -1218,10 +1243,8 @@ static time_t find_uuid_first_time(
                 size_t found_index = live_entry - uuid_list;
                 journal_search_start = found_index + 1; // Next search starts after this match
 
-                if (journal_search_start >= journal_metric_count) {
-                    not_matching_bsearches += (count - index - 1);
+                if (journal_search_start >= journal_metric_count)
                     break;
-                }
 
                 uuid_original_entry->pages_found += live_entry->entries;
                 uuid_original_entry->df_matched++;
@@ -1241,8 +1264,10 @@ static time_t find_uuid_first_time(
                 }
             }
         } else {
-            nd_log_daemon(NDLP_ERR, "DBENGINE: journalfile \"%s\" is corrupted, skipping it", file_path);
+            journal_access_failed = true;
         }
+
+release_journal:
         journalfile_v2_data_release(datafile->journalfile);
 
         if (agent_shutdown) {
@@ -1252,6 +1277,9 @@ static time_t find_uuid_first_time(
 
         journalfile_count++;
         datafile = datafile_release_and_acquire_next_for_retention(ctx, datafile);
+        if (journal_access_failed)
+            continue;
+
         if (!any_matching) {
             if (datafile)
                 datafile_release(datafile, DATAFILE_ACQUIRE_RETENTION);
@@ -1497,7 +1525,7 @@ void datafile_delete(
                 // pending_deletion is already set, blocking new acquires.
                 // Bail out and let the next rotation cycle retry - lockers
                 // will drain over time since no new ones can be added.
-                netdata_log_error("DBENGINE: tier %d: " DATAFILE_PREFIX RRDENG_FILE_NUMBER_PRINT_TMPL
+                netdata_log_error("DBENGINE: tier %u: " DATAFILE_PREFIX RRDENG_FILE_NUMBER_PRINT_TMPL
                                   " could not be acquired for deletion after %zu attempts (%u lockers remain)"
                                   " - will retry on next rotation",
                                   tier, datafile->tier, fileno, attempts, datafile->users.lockers);
@@ -1508,7 +1536,7 @@ void datafile_delete(
                 return;
             }
 
-            netdata_log_info("DBENGINE: tier %d: waiting for " DATAFILE_PREFIX RRDENG_FILE_NUMBER_PRINT_TMPL
+            netdata_log_info("DBENGINE: tier %u: waiting for " DATAFILE_PREFIX RRDENG_FILE_NUMBER_PRINT_TMPL
                          " to be available for deletion, in use by %u users.",
                  tier, datafile->tier, fileno, datafile->users.lockers);
 
@@ -1528,7 +1556,7 @@ void datafile_delete(
 //    }
 
     __atomic_add_fetch(&rrdeng_cache_efficiency_stats.datafile_deletion_started, 1, __ATOMIC_RELAXED);
-    netdata_log_info("DBENGINE: tier %d: deleting " DATAFILE_PREFIX RRDENG_FILE_NUMBER_PRINT_TMPL " to maintain %s.",
+    netdata_log_info("DBENGINE: tier %u: deleting " DATAFILE_PREFIX RRDENG_FILE_NUMBER_PRINT_TMPL " to maintain %s.",
                      tier, datafile->tier, fileno, disk_time ? "disk quota" : "time retention");
 
     if(worker)
@@ -1586,10 +1614,10 @@ void datafile_delete(
     bool exp_njfv2 = expected_journal_files & JOURNALFILE_DELETED_V2;
 
     if (del_ndf && del_njf && del_njfv2)
-        netdata_log_info("DBENGINE: tier %d: deleted " DATAFILE_PREFIX RRDENG_FILE_NUMBER_PRINT_TMPL " (.ndf, .njf, .njfv2), reclaimed %s.",
+        netdata_log_info("DBENGINE: tier %u: deleted " DATAFILE_PREFIX RRDENG_FILE_NUMBER_PRINT_TMPL " (.ndf, .njf, .njfv2), reclaimed %s.",
                          tier, datafile_tier, fileno, size_for_humans);
     else if (del_ndf && del_njf && !exp_njfv2)
-        netdata_log_info("DBENGINE: tier %d: deleted " DATAFILE_PREFIX RRDENG_FILE_NUMBER_PRINT_TMPL " (.ndf, .njf), reclaimed %s.",
+        netdata_log_info("DBENGINE: tier %u: deleted " DATAFILE_PREFIX RRDENG_FILE_NUMBER_PRINT_TMPL " (.ndf, .njf), reclaimed %s.",
                          tier, datafile_tier, fileno, size_for_humans);
     else if (del_ndf || del_njf || del_njfv2) {
         BUFFER *removed = buffer_create(0, NULL);
@@ -1607,18 +1635,18 @@ void datafile_delete(
         if (exp_njfv2 && !del_njfv2) { buffer_strcat(failed, sep); buffer_strcat(failed, ".njfv2"); }
 
         if(buffer_strlen(failed))
-            netdata_log_error("DBENGINE: tier %d: partial delete of " DATAFILE_PREFIX RRDENG_FILE_NUMBER_PRINT_TMPL
+            netdata_log_error("DBENGINE: tier %u: partial delete of " DATAFILE_PREFIX RRDENG_FILE_NUMBER_PRINT_TMPL
                               " - removed: %s, failed: %s, reclaimed %s.",
                               tier, datafile_tier, fileno,
                               buffer_tostring(removed), buffer_tostring(failed), size_for_humans);
         else
-            netdata_log_info("DBENGINE: tier %d: deleted " DATAFILE_PREFIX RRDENG_FILE_NUMBER_PRINT_TMPL " (%s), reclaimed %s.",
+            netdata_log_info("DBENGINE: tier %u: deleted " DATAFILE_PREFIX RRDENG_FILE_NUMBER_PRINT_TMPL " (%s), reclaimed %s.",
                              tier, datafile_tier, fileno, buffer_tostring(removed), size_for_humans);
         buffer_free(removed);
         buffer_free(failed);
     }
     else
-        netdata_log_error("DBENGINE: tier %d: failed to delete " DATAFILE_PREFIX RRDENG_FILE_NUMBER_PRINT_TMPL " to maintain %s.",
+        netdata_log_error("DBENGINE: tier %u: failed to delete " DATAFILE_PREFIX RRDENG_FILE_NUMBER_PRINT_TMPL " to maintain %s.",
                           tier, datafile_tier, fileno, disk_time ? "disk quota" : "time retention");
 }
 

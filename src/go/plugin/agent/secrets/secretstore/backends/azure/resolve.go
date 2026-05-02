@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/netdata/netdata/go/plugins/logger"
 	"github.com/netdata/netdata/go/plugins/plugin/agent/secrets/secretstore"
 	"github.com/netdata/netdata/go/plugins/plugin/agent/secrets/secretstore/internal/httpx"
 )
@@ -41,7 +42,7 @@ func (s *publishedStore) resolve(ctx context.Context, req secretstore.ResolveReq
 	}
 	httpReq.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := s.provider.apiClient.Do(httpReq)
+	resp, err := s.runtime.apiClient.Do(httpReq)
 	if err != nil {
 		return "", fmt.Errorf("resolving secret '%s': store '%s': request failed: %w", req.Original, req.StoreKey, err)
 	}
@@ -64,7 +65,14 @@ func (s *publishedStore) resolve(ctx context.Context, req secretstore.ResolveReq
 	if result.Value == "" {
 		return "", fmt.Errorf("resolving secret '%s': store '%s': Azure Key Vault returned empty secret value", req.Original, req.StoreKey)
 	}
+	logResolvedRequest(ctx, req, vaultName, secretName)
 	return result.Value, nil
+}
+
+func logResolvedRequest(ctx context.Context, req secretstore.ResolveRequest, vaultName, secretName string) {
+	if log, ok := logger.LoggerFromContext(ctx); ok {
+		log.Infof("resolved secret via azure-kv secretstore '%s' vault '%s' secret '%s'", req.StoreKey, vaultName, secretName)
+	}
 }
 
 func splitOperand(operand string) (string, string, bool) {

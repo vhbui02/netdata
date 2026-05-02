@@ -28,6 +28,43 @@ static void __attribute__((destructor)) destroy_mutex(void) {
     netdata_mutex_destroy(&db_mutex);
 }
 
+namespace {
+
+// Guard against silent truncation when time_t is narrower than sqlite3_int64
+// (e.g. 32-bit builds). if constexpr ensures the dead branches are elided at
+// compile time on 64-bit platforms, avoiding constant-expression warnings.
+static inline bool ml_sqlite_int64_fits_time_t(sqlite3_int64 value)
+{
+    if constexpr (!std::numeric_limits<time_t>::is_signed ||
+                  std::numeric_limits<time_t>::digits < std::numeric_limits<sqlite3_int64>::digits) {
+        // coverity[CONSTANT_EXPRESSION_RESULT] - on 64-bit, Coverity still analyzes
+        // this dead branch; reachable only on 32-bit or unsigned time_t builds.
+        if (value < (sqlite3_int64) std::numeric_limits<time_t>::min())
+            return false;
+    }
+    if constexpr (std::numeric_limits<time_t>::digits < std::numeric_limits<sqlite3_int64>::digits) {
+        // coverity[CONSTANT_EXPRESSION_RESULT] - dead on same-width 64-bit time_t;
+        // reachable only when time_t is narrower than sqlite3_int64, but Coverity
+        // still analyzes this discarded if constexpr branch.
+        if (value > (sqlite3_int64) std::numeric_limits<time_t>::max())
+            return false;
+    }
+    return true;
+}
+
+}
+
+static inline size_t ml_dimension_smoothing_window(const ml_dimension_t *dim)
+{
+    unsigned chart_update_every = dim->rd->rrdset->update_every;
+    if (chart_update_every > nd_profile.update_every)
+        return 1;
+
+    // max_samples_to_smooth == 0 is normalized to an effective smoothing window
+    // of 1 for feature extraction.
+    return std::max<size_t>(Cfg.max_samples_to_smooth, 1);
+}
+
 typedef struct {
     // First/last entry of the dimension in DB when generating the response
     time_t first_entry_on_response;
@@ -57,7 +94,7 @@ ml_dimension_calculated_numbers(ml_worker_t *worker, ml_dimension_t *dim)
     training_response.last_entry_on_response = rrddim_last_entry_s_of_tier(dim->rd, 0);
 
     unsigned chart_update_every = dim->rd->rrdset->update_every;
-    size_t smoothing_window = (chart_update_every > nd_profile.update_every) ? 1 : Cfg.max_samples_to_smooth;
+    size_t smoothing_window = ml_dimension_smoothing_window(dim);
     size_t min_required_samples = Cfg.diff_n + smoothing_window + Cfg.lag_n;
 
     auto round_up_div = [](time_t window, unsigned step) -> size_t {
@@ -211,11 +248,11 @@ ml_dimension_add_model(const nd_uuid_t *metric_uuid, const ml_kmeans_inlined_t *
     if (unlikely(rc != SQLITE_OK))
         goto bind_fail;
 
-    rc = sqlite3_bind_int(res, ++param, (int) inlined_km->after);
+    rc = sqlite3_bind_int64(res, ++param, (sqlite3_int64) inlined_km->after);
     if (unlikely(rc != SQLITE_OK))
         goto bind_fail;
 
-    rc = sqlite3_bind_int(res, ++param, (int) inlined_km->before);
+    rc = sqlite3_bind_int64(res, ++param, (sqlite3_int64) inlined_km->before);
     if (unlikely(rc != SQLITE_OK))
         goto bind_fail;
 
@@ -286,7 +323,7 @@ ml_dimension_delete_models(const nd_uuid_t *metric_uuid, time_t before)
     if (unlikely(rc != SQLITE_OK))
         goto bind_fail;
 
-    rc = sqlite3_bind_int(res, ++param, (int) before);
+    rc = sqlite3_bind_int64(res, ++param, (sqlite3_int64) before);
     if (unlikely(rc != SQLITE_OK))
         goto bind_fail;
 
@@ -333,9 +370,9 @@ ml_prune_old_models(size_t num_models_to_prune)
         }
     }
 
-    int after = (int) (now_realtime_sec() - Cfg.delete_models_older_than);
+    time_t after = now_realtime_sec() - (time_t) Cfg.delete_models_older_than;
 
-    rc = sqlite3_bind_int(res, ++param, after);
+    rc = sqlite3_bind_int64(res, ++param, (sqlite3_int64) after);
     if (unlikely(rc != SQLITE_OK))
         goto bind_fail;
 
@@ -418,8 +455,19 @@ int ml_dimension_load_models(RRDDIM *rd, sqlite3_stmt **active_stmt) {
     while ((rc = sqlite3_step_monitored(res)) == SQLITE_ROW) {
         ml_kmeans_t km;
 
-        km.after = sqlite3_column_int(res, 0);
-        km.before = sqlite3_column_int(res, 1);
+        sqlite3_int64 raw_after  = sqlite3_column_int64(res, 0);
+        sqlite3_int64 raw_before = sqlite3_column_int64(res, 1);
+        // Protect against silent truncation when time_t is narrower than int64_t
+        // (e.g. 32-bit builds, corrupted DB, or far-future timestamps).
+        if (!ml_sqlite_int64_fits_time_t(raw_after) ||
+            !ml_sqlite_int64_fits_time_t(raw_before)) {
+            error_report("Skipping ML model row with out-of-range timestamps: after=%" PRId64 " before=%" PRId64,
+                         (int64_t) raw_after, (int64_t) raw_before);
+            continue;
+        }
+
+        km.after  = (time_t) raw_after;
+        km.before = (time_t) raw_before;
 
         km.min_dist = sqlite3_column_double(res, 2);
         km.max_dist = sqlite3_column_double(res, 3);
@@ -724,13 +772,12 @@ ml_dimension_train_model(ml_worker_t *worker, ml_dimension_t *dim)
         memcpy(worker->scratch_training_cns, worker->training_cns,
                training_response.total_values * sizeof(calculated_number_t));
 
-        size_t smoothing_window = (dim->rd->rrdset->update_every > nd_profile.update_every) ? 1 : Cfg.max_samples_to_smooth;
+        size_t smoothing_window = ml_dimension_smoothing_window(dim);
 
         ml_features_t features = {
             Cfg.diff_n, smoothing_window, Cfg.lag_n,
             worker->scratch_training_cns, training_response.total_values,
-            worker->training_cns, training_response.total_values,
-            worker->training_samples
+            worker->training_cns, training_response.total_values
         };
         
         // Calculate dynamic sampling ratio based on expected output size
@@ -746,10 +793,10 @@ ml_dimension_train_model(ml_worker_t *worker, ml_dimension_t *dim)
         }
 
         // Apply sampling during lag feature extraction
-        ml_features_preprocess(&features, sampling_ratio);
+        ml_features_preprocess(&features, worker->training_samples, sampling_ratio);
 
         ml_kmeans_init(&dim->kmeans);
-        ml_kmeans_train(&dim->kmeans, &features,  Cfg.max_kmeans_iters, training_response.query_after_t, training_response.query_before_t);
+        ml_kmeans_train(&dim->kmeans, worker->training_samples, Cfg.max_kmeans_iters, training_response.query_after_t, training_response.query_before_t);
     }
 
     // update models
@@ -772,42 +819,79 @@ ml_dimension_predict(ml_dimension_t *dim, calculated_number_t value, bool exists
     // Don't treat values that don't exist as anomalous
     if (!exists) {
         dim->cns.clear();
+        dim->cns_head = 0;
         spinlock_unlock(&dim->slock);
         return false;
     }
 
     // Save the value and return if we don't have enough values for a sample
-    unsigned n = Cfg.diff_n + Cfg.max_samples_to_smooth + Cfg.lag_n;
-    if (dim->cns.size() < n) {
+    size_t smoothing_window = ml_dimension_smoothing_window(dim);
+    unsigned n = Cfg.diff_n + smoothing_window + Cfg.lag_n;
+
+    size_t cns_size = dim->cns.size();
+
+    // The ring buffer modulus is derived from the current effective smoothing
+    // window. When the effective window changes, the existing history is only
+    // reusable if it is still a linear chronological prefix, which in this
+    // representation means cns_head == 0. Wrapped ring state from the old
+    // modulus must be discarded before warmup/indexing/linearization continue.
+    bool invalid_head = (cns_size > 0 && dim->cns_head >= cns_size);
+    bool size_changed_with_wrapped_state = (cns_size != n && dim->cns_head != 0);
+    bool shrunk_below_existing_history = (cns_size > n);
+    if (invalid_head || size_changed_with_wrapped_state || shrunk_below_existing_history) {
+        dim->cns.clear();
+        dim->cns_head = 0;
+        cns_size = 0;
+    }
+
+    if (cns_size < n) {
         dim->cns.push_back(value);
         spinlock_unlock(&dim->slock);
         return false;
     }
 
-    // Push the value and check if it's different from the last one
-    bool same_value = true;
-    std::rotate(std::begin(dim->cns), std::begin(dim->cns) + 1, std::end(dim->cns));
-    if (dim->cns[n - 1] != value)
-        same_value = false;
-    dim->cns[n - 1] = value;
+    // Compare incoming value against the most recent sample (newest_idx).
+    //
+    // The old std::rotate code compared against the oldest element being dropped — that
+    // was a side effect of rotate mechanics, not intentional design.
+    //
+    // Downstream effect: when same_value is false, we set dim->mt = METRIC_TYPE_VARIABLE.
+    // This controls two things:
+    //   1. ml_dimension_train_model() skips training when mt == METRIC_TYPE_CONSTANT.
+    //   2. Statistics reporting counts constant vs variable dimensions.
+    //
+    // Comparing against newest is safe (and more correct) because:
+    //   - For truly constant series, all elements are equal — either comparison works.
+    //   - For changing series, comparing against newest detects the transition on the
+    //     first differing tick. The old oldest-comparison could miss transitions when
+    //     the oldest element happened to equal the new value by coincidence.
+    //   - mt is reset to METRIC_TYPE_CONSTANT after each training cycle,
+    //     so a single false negative cannot cause a permanent misclassification.
+    size_t newest_idx = (dim->cns_head + n - 1) % n;
+    bool same_value = (dim->cns[newest_idx] == value);
+    dim->cns[dim->cns_head] = value;
+    dim->cns_head = (dim->cns_head + 1) % n;
 
     // Create the sample
-    assert((n * (Cfg.lag_n + 1) <= 128) &&
-           "Static buffers too small to perform prediction. "
-           "This should not be possible with the default clamping of feature extraction options");
     calculated_number_t src_cns[128];
     calculated_number_t dst_cns[128];
+    constexpr size_t src_cns_capacity = sizeof(src_cns) / sizeof(src_cns[0]);
+    constexpr size_t dst_cns_capacity = sizeof(dst_cns) / sizeof(dst_cns[0]);
+    fatal_assert((n <= src_cns_capacity && n <= dst_cns_capacity) &&
+                 "Static buffers too small to perform prediction. "
+                 "This should not be possible with the default clamping of feature extraction options");
 
-    memset(src_cns, 0, n * (Cfg.lag_n + 1) * sizeof(calculated_number_t));
-    memcpy(src_cns, dim->cns.data(), n * sizeof(calculated_number_t));
-    memcpy(dst_cns, dim->cns.data(), n * sizeof(calculated_number_t));
+    size_t first_chunk = n - dim->cns_head;
+    memcpy(src_cns, dim->cns.data() + dim->cns_head, first_chunk * sizeof(calculated_number_t));
+    if (dim->cns_head)
+        memcpy(src_cns + first_chunk, dim->cns.data(), dim->cns_head * sizeof(calculated_number_t));
+    memcpy(dst_cns, src_cns, n * sizeof(calculated_number_t));
 
     ml_features_t features = {
-        Cfg.diff_n, Cfg.max_samples_to_smooth, Cfg.lag_n,
-        dst_cns, n, src_cns, n,
-        dim->feature
+        Cfg.diff_n, smoothing_window, Cfg.lag_n,
+        dst_cns, n, src_cns, n
     };
-    ml_features_preprocess(&features, 1.0);
+    ml_features_preprocess_predict(&features, dim->feature);
 
     // Mark the metric time as variable if we received different values
     if (!same_value)
@@ -831,7 +915,7 @@ ml_dimension_predict(ml_dimension_t *dim, calculated_number_t value, bool exists
     for (const auto &km_ctx : dim->km_contexts) {
         models_consulted++;
 
-        calculated_number_t anomaly_score = ml_kmeans_anomaly_score(&km_ctx, features.preprocessed_features[0]);
+        calculated_number_t anomaly_score = ml_kmeans_anomaly_score(&km_ctx, dim->feature);
         if (std::isnan(anomaly_score))
             continue;
 
@@ -922,7 +1006,7 @@ ml_chart_update_dimension(ml_chart_t *chart, ml_dimension_t *dim, bool is_anomal
 #define WORKER_JOB_DETECTION_STATS 3
 
 static void
-ml_host_detect_once(ml_host_t *host)
+ml_host_detect_once(ml_host_t *host, ONEWAYALLOC *owa)
 {
     worker_is_busy(WORKER_JOB_DETECTION_COLLECT_STATS);
 
@@ -997,7 +1081,7 @@ ml_host_detect_once(ml_host_t *host)
         ml_update_dimensions_chart(host, mls_copy);
 
         worker_is_busy(WORKER_JOB_DETECTION_HOST_CHART);
-        ml_update_host_and_detection_rate_charts(host, host->host_anomaly_rate * 10000.0);
+        ml_update_host_and_detection_rate_charts(host, host->host_anomaly_rate * 10000.0, owa);
     } else {
         host->host_anomaly_rate = 0.0;
 
@@ -1025,6 +1109,13 @@ void ml_detect_main(void *arg)
     heartbeat_t hb;
     heartbeat_init(&hb, USEC_PER_SEC);
 
+    // Single onewayalloc arena reused across every host and loop iteration
+    // for the whole detect thread lifetime — one mmap/munmap pair instead
+    // of one per host per second. The arena is reset between hosts inside
+    // ml_update_host_and_detection_rate_charts, so peak memory stays bounded
+    // by a single host's anomaly-rate query scratch.
+    ONEWAYALLOC *detect_owa = onewayalloc_create(0);
+
     while (!Cfg.detection_stop && service_running(SERVICE_COLLECTORS)) {
         worker_is_idle();
         heartbeat_next(&hb);
@@ -1038,7 +1129,7 @@ void ml_detect_main(void *arg)
             if (!service_running(SERVICE_COLLECTORS))
                 break;
 
-            ml_host_detect_once((ml_host_t *) rh->ml_host);
+            ml_host_detect_once((ml_host_t *) rh->ml_host, detect_owa);
         }
         rrd_rdunlock();
 
@@ -1055,6 +1146,9 @@ void ml_detect_main(void *arg)
             }
         }
     }
+
+    onewayalloc_destroy(detect_owa);
+
     Cfg.training_stop = true;
     finalize_self_prepared_sql_statements();
 }

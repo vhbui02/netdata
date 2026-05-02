@@ -73,6 +73,46 @@ func loadProfiles() {
 	})
 }
 
+// LoadProfileByName loads a single profile by filename (with or without extension).
+// This supports loading abstract profiles (e.g., "_std-*.yaml") for programmatic use.
+func LoadProfileByName(name string) (*Profile, error) {
+	paths := getProfilesDirs()
+
+	candidates := []string{name}
+	if !strings.HasSuffix(name, ".yaml") && !strings.HasSuffix(name, ".yml") {
+		candidates = []string{name + ".yaml", name + ".yml"}
+	}
+
+	var lastErr error
+	for _, cand := range candidates {
+		path, err := paths.Find(cand)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		profile, err := loadProfile(path, paths)
+		if err != nil {
+			return nil, err
+		}
+
+		if err := profile.validate(); err != nil {
+			return nil, err
+		}
+		if err := CompileTransforms(profile); err != nil {
+			return nil, err
+		}
+		profile.removeConstantMetrics()
+
+		return profile, nil
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("profile '%s' not found", name)
+	}
+	return nil, lastErr
+}
+
 func loadProfilesFromDir(dirpath string, extendsPaths multipath.MultiPath) ([]*Profile, error) {
 	var profiles []*Profile
 
@@ -142,6 +182,7 @@ func loadProfileWithExtendsMap(filename string, extendsPaths multipath.MultiPath
 	}
 
 	prof.extensionHierarchy = make([]*extensionInfo, 0, len(prof.Definition.Extends))
+	mergedBases := make([]*Profile, 0, len(prof.Definition.Extends))
 
 	for _, name := range prof.Definition.Extends {
 		if slices.Contains(stack, name) {
@@ -164,8 +205,13 @@ func loadProfileWithExtendsMap(filename string, extendsPaths multipath.MultiPath
 			extensions: mergedBase.extensionHierarchy,
 		}
 		prof.extensionHierarchy = append(prof.extensionHierarchy, extInfo)
+		mergedBases = append(mergedBases, mergedBase)
+	}
 
-		prof.merge(mergedBase)
+	// Merge in reverse so later extends override earlier ones while the
+	// current profile still keeps the highest precedence.
+	for i := len(mergedBases) - 1; i >= 0; i-- {
+		prof.merge(mergedBases[i])
 	}
 
 	return &prof, nil

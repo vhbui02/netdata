@@ -10,28 +10,15 @@ import (
 	"github.com/netdata/netdata/go/plugins/plugin/go.d/collector/azure_monitor/azureprofiles"
 )
 
-func (c *Collector) buildQueryBatches(resources []resourceInfo, now time.Time) []queryBatch {
+func (c *Collector) buildQueryBatches(now time.Time) []queryBatch {
 	dueByGrain := make(map[string]bool)
-	resourcesByType := c.indexResourcesByType(resources)
 	var batches []queryBatch
 
 	for _, profile := range c.runtime.Profiles {
-		batches = append(batches, c.buildProfileQueryBatches(profile, resourcesByType[stringsLowerTrim(profile.ResourceType)], dueByGrain, now)...)
+		batches = append(batches, c.buildProfileQueryBatches(profile, c.discovery.ByProfile[profile.Name], dueByGrain, now)...)
 	}
 
 	return batches
-}
-
-func (c *Collector) indexResourcesByType(resources []resourceInfo) map[string][]resourceInfo {
-	if len(c.discovery.ByType) > 0 {
-		return c.discovery.ByType
-	}
-
-	result := make(map[string][]resourceInfo)
-	for _, resource := range resources {
-		result[stringsLowerTrim(resource.Type)] = append(result[stringsLowerTrim(resource.Type)], resource)
-	}
-	return result
 }
 
 func (c *Collector) buildProfileQueryBatches(profile *profileRuntime, resources []resourceInfo, dueByGrain map[string]bool, now time.Time) []queryBatch {
@@ -50,19 +37,20 @@ func (c *Collector) buildProfileQueryBatches(profile *profileRuntime, resources 
 			continue
 		}
 
-		for region, regionResources := range groupResourcesByRegion(resources) {
-			for metricChunk := range slices.Chunk(metrics, c.MaxMetricsPerQuery) {
+		for key, groupedResources := range groupResourcesBySubscriptionRegion(resources) {
+			for metricChunk := range slices.Chunk(metrics, c.Limits.MaxMetricsPerQuery) {
 				names := batchMetricNames(metricChunk)
 				aggregations := batchAggregations(metricChunk)
-				for resourceChunk := range slices.Chunk(regionResources, c.MaxBatchResources) {
+				for resourceChunk := range slices.Chunk(groupedResources, c.Limits.MaxBatchResources) {
 					batches = append(batches, queryBatch{
+						SubscriptionID: key.SubscriptionID,
 						Profile:        profile,
 						Metrics:        metricChunk,
 						MetricNames:    append([]string(nil), names...),
 						Aggregations:   append([]string(nil), aggregations...),
 						TimeGrain:      grain,
 						TimeGrainEvery: azureprofiles.SupportedTimeGrains[grain],
-						Region:         region,
+						Region:         key.Region,
 						Resources:      append([]resourceInfo(nil), resourceChunk...),
 					})
 				}
@@ -117,11 +105,19 @@ func batchAggregations(metrics []*metricRuntime) []string {
 	return list
 }
 
-func groupResourcesByRegion(resources []resourceInfo) map[string][]resourceInfo {
-	result := make(map[string][]resourceInfo)
+type subscriptionRegionKey struct {
+	SubscriptionID string
+	Region         string
+}
+
+func groupResourcesBySubscriptionRegion(resources []resourceInfo) map[subscriptionRegionKey][]resourceInfo {
+	result := make(map[subscriptionRegionKey][]resourceInfo)
 	for _, r := range resources {
-		region := normalizeRegion(r.Region)
-		result[region] = append(result[region], r)
+		key := subscriptionRegionKey{
+			SubscriptionID: stringsTrim(r.SubscriptionID),
+			Region:         normalizeRegion(r.Region),
+		}
+		result[key] = append(result[key], r)
 	}
 	return result
 }

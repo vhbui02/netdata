@@ -107,9 +107,16 @@ ALWAYS_INLINE struct rrdengine_datafile *njfv2idx_find_and_acquire_j2_header(NJF
 
         datafile = *PValue;
 
-        struct rrdengine_journalfile *journalfile = datafile ? datafile->journalfile : NULL;
+        if (!datafile || !datafile_acquire(datafile, DATAFILE_ACQUIRE_PAGE_DETAILS)) {
+            datafile = NULL;
+            PValue = NULL;
+            continue;
+        }
 
-        if (!datafile || !journalfile) {
+        struct rrdengine_journalfile *journalfile = datafile->journalfile;
+
+        if (!journalfile) {
+            datafile_release(datafile, DATAFILE_ACQUIRE_PAGE_DETAILS);
             datafile = NULL;
             PValue = NULL;
             continue;
@@ -121,29 +128,36 @@ ALWAYS_INLINE struct rrdengine_datafile *njfv2idx_find_and_acquire_j2_header(NJF
                                                       s->wanted_end_time_s);
 
         if(rc == PAGE_IS_IN_RANGE) {
-            // this is good to return
-            break;
+            s->j2_header_acquired = journalfile_v2_data_acquire(journalfile, NULL,
+                                                                s->wanted_start_time_s,
+                                                                s->wanted_end_time_s);
+            if(s->j2_header_acquired) {
+                // this is good to return
+                break;
+            }
+
+            datafile_release(datafile, DATAFILE_ACQUIRE_PAGE_DETAILS);
+            datafile = NULL;
+            PValue = NULL;
+            continue;
         }
         else if(rc == PAGE_IS_IN_THE_PAST) {
             // continue to get the next
+            datafile_release(datafile, DATAFILE_ACQUIRE_PAGE_DETAILS);
             datafile = NULL;
             PValue = NULL;
             continue;
         }
         else /* PAGE_IS_IN_THE_FUTURE */ {
             // we finished - no more datafiles
+            datafile_release(datafile, DATAFILE_ACQUIRE_PAGE_DETAILS);
             datafile = NULL;
             PValue = NULL;
             break;
         }
     }
 
-    struct rrdengine_journalfile *journalfile = datafile ? datafile->journalfile : NULL;
-    if(datafile && journalfile)
-        s->j2_header_acquired = journalfile_v2_data_acquire(journalfile, NULL,
-                                                            s->wanted_start_time_s,
-                                                            s->wanted_end_time_s);
-    else
+    if(!datafile)
         s->j2_header_acquired = NULL;
 
     rw_spinlock_read_unlock(&s->ctx->njfv2idx.spinlock);
@@ -1373,8 +1387,8 @@ bool journalfile_migrate_to_v2_callback(Word_t section, unsigned datafile_fileno
 
     journalfile_v2_generate_path(datafile, path, sizeof(path));
 
-    netdata_log_info("DBENGINE: tier %d: indexing journal v2 file %s: extents %zu, metrics %zu, pages %zu",
-        datafile_ctx(datafile)->config.tier, path,
+    netdata_log_info("DBENGINE: tier %d: indexing " WALFILE_PREFIX RRDENG_FILE_NUMBER_PRINT_TMPL WALFILE_EXTENSION_V2 ": extents %zu, metrics %zu, pages %zu",
+        ctx->config.tier, datafile->tier, datafile->fileno,
         number_of_extents,
         number_of_metrics,
         number_of_pages);
@@ -1409,9 +1423,11 @@ bool journalfile_migrate_to_v2_callback(Word_t section, unsigned datafile_fileno
     uint32_t trailer_offset = total_file_size;
     total_file_size  += sizeof(struct journal_v2_block_trailer);
 
-    int fd_v2;
+    int fd_v2 = -1;
     uint8_t *data_start = nd_mmap_advanced(path, total_file_size, MAP_SHARED, 0, false, true, &fd_v2);
     if(!data_start) {
+        if(fd_v2 != -1)
+            close(fd_v2);
         nd_log_daemon(NDLP_WARNING, "DBENGINE: Failed to allocate %"PRIu64" bytes of memory for journal file \"%s\". Will retry later", total_file_size, path);
         return false;
     }
@@ -1567,8 +1583,8 @@ bool journalfile_migrate_to_v2_callback(Word_t section, unsigned datafile_fileno
 
             char size_for_humans[128];
             size_snprintf(size_for_humans, sizeof(size_for_humans), total_file_size, "B", false);
-            netdata_log_info("DBENGINE: tier %d: migrated journal v2 file %s, %s",
-                           ctx->config.tier, path, size_for_humans);
+            netdata_log_info("DBENGINE: tier %d: migrated " WALFILE_PREFIX RRDENG_FILE_NUMBER_PRINT_TMPL WALFILE_EXTENSION_V2 ", %s",
+                           ctx->config.tier, datafile->tier, datafile->fileno, size_for_humans);
 
             // msync(data_start, total_file_size, MS_SYNC);
             journalfile_v2_data_set(journalfile, fd_v2, data_start, total_file_size);
@@ -1589,6 +1605,8 @@ bool journalfile_migrate_to_v2_callback(Word_t section, unsigned datafile_fileno
     netdata_log_info("DBENGINE: failed to build index \"%s\", file will be skipped", path);
 
     nd_munmap(data_start, total_file_size);
+    if(fd_v2 != -1)
+        close(fd_v2);
     unlink(path);
     return false;
 }

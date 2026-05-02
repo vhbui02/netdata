@@ -36,12 +36,43 @@ func TestLoadFromDefaultDirs_LoadsAllStockProfiles(t *testing.T) {
 	catalog, err := LoadFromDefaultDirs()
 	require.NoError(t, err)
 
-	ids := catalog.DefaultProfileIDs()
-	require.Len(t, ids, want)
+	assert.Len(t, catalog.byBaseName, want)
+}
 
-	profiles, err := catalog.Resolve(ids)
+func TestLoadFromDefaultDirs_StockProfilesUseSelectorShorthand(t *testing.T) {
+	dir := azureProfilesDirFromThisFile()
+	require.NotEmpty(t, dir)
+
+	entries, err := os.ReadDir(dir)
 	require.NoError(t, err)
-	require.Len(t, profiles, want)
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		ext := strings.ToLower(filepath.Ext(name))
+		if ext != ".yaml" && ext != ".yml" {
+			continue
+		}
+
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		require.NoError(t, err)
+
+		for line := range strings.SplitSeq(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if !strings.HasPrefix(line, "- selector:") {
+				continue
+			}
+
+			selector := strings.TrimSpace(strings.TrimPrefix(line, "- selector:"))
+			if selector == "" || strings.HasPrefix(selector, "{") {
+				continue
+			}
+
+			assert.NotContainsf(t, selector, ".", "stock profile %q should use selector shorthand, found %q", name, selector)
+		}
+	}
 }
 
 func TestDefaultCatalog_CachesSuccessfulLoads(t *testing.T) {
@@ -59,8 +90,8 @@ func TestDefaultCatalog_CachesSuccessfulLoads(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, 1, calls)
-	assert.Equal(t, []string{"sql_database"}, first.DefaultProfileIDs())
-	assert.Equal(t, []string{"sql_database"}, second.DefaultProfileIDs())
+	assert.Equal(t, []string{"sql_database"}, first.defaultProfileBaseNames())
+	assert.Equal(t, []string{"sql_database"}, second.defaultProfileBaseNames())
 }
 
 func TestDefaultCatalog_RetriesAfterFailure(t *testing.T) {
@@ -81,7 +112,7 @@ func TestDefaultCatalog_RetriesAfterFailure(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, 2, calls)
-	assert.Equal(t, []string{"postgres_flexible"}, catalog.DefaultProfileIDs())
+	assert.Equal(t, []string{"postgres_flexible"}, catalog.defaultProfileBaseNames())
 }
 
 func TestDefaultCatalog_DoesNotCacheWhenDisabled(t *testing.T) {
@@ -126,12 +157,13 @@ func stubDefaultCatalog(t *testing.T, cacheEnabled func() bool, loader func() (C
 }
 
 func testCatalog(id string) Catalog {
+	profile := Profile{DisplayName: id}
 	return Catalog{
-		byID: map[string]Profile{
-			id: {ID: id, Name: id},
+		byBaseName: map[string]Profile{
+			normalizeKey(id): profile,
 		},
-		stockProfileIDs: map[string]struct{}{
-			id: {},
+		stockProfileBaseNames: map[string]struct{}{
+			normalizeKey(id): {},
 		},
 	}
 }
