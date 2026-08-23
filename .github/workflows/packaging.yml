@@ -11,6 +11,7 @@ on:
   push:
     branches:
       - master
+      - bypass-cloud
   workflow_dispatch:
     inputs:
       type:
@@ -105,7 +106,7 @@ jobs:
         id: prepare
         run: |
           sudo apt-get update || true
-          sudo apt-get install -y python3-ruamel.yaml
+          sudo apt-get install -y python3-ruamel.yaml jq
       - name: Read build matrix
         id: set-matrix
         run: |
@@ -115,28 +116,9 @@ jobs:
           else
             matrix="$(.github/scripts/gen-matrix-packaging.py 0)"
           fi
+          matrix=$(echo "${matrix}" | jq -c '{include: [.include[] | select((.distro == "fedora" and .arch == "x86_64") or (.distro == "debian" and .arch == "arm64" ))]}')
           echo "Generated matrix: ${matrix}"
           echo "matrix=${matrix}" >> "${GITHUB_OUTPUT}"
-      - name: Failure Notification
-        uses: rtCamp/action-slack-notify@v2
-        env:
-          SLACK_COLOR: 'danger'
-          SLACK_ICON_EMOJI: ':github-actions:'
-          SLACK_TITLE: 'Package Build matrix generation failed:'
-          SLACK_USERNAME: 'GitHub Actions'
-          SLACK_MESSAGE: |-
-              ${{ github.repository }}: Failed to generate build matrix for package build.
-              Checkout: ${{ steps.checkout.outcome }}
-              Prepare Tools: ${{ steps.prepare.outcome }}
-              Read Build Matrix: ${{ steps.set-matrix.outcome }}
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
-        if: >-
-          ${{
-            failure()
-            && github.event_name != 'pull_request'
-            && startsWith(github.ref, 'refs/heads/master')
-            && github.repository == 'netdata/netdata'
-          }}
 
   version-check:
     name: Version check
@@ -174,25 +156,6 @@ jobs:
             echo "version=$(cut -d'-' -f 1 packaging/version | tr -d 'v')" >> "${GITHUB_OUTPUT}"
             echo "retention=0" >> "${GITHUB_OUTPUT}"
           fi
-      - name: Failure Notification
-        uses: rtCamp/action-slack-notify@v2
-        env:
-          SLACK_COLOR: 'danger'
-          SLACK_ICON_EMOJI: ':github-actions:'
-          SLACK_TITLE: 'Package Build version check failed:'
-          SLACK_USERNAME: 'GitHub Actions'
-          SLACK_MESSAGE: |-
-              ${{ github.repository }}: Failed to generate version information for package build.
-              Checkout: ${{ steps.checkout.outcome }}
-              Check Version: ${{ steps.check-version.outcome }}
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
-        if: >-
-          ${{
-            failure()
-            && github.event_name != 'pull_request'
-            && startsWith(github.ref, 'refs/heads/master')
-            && github.repository == 'netdata/netdata'
-          }}
 
   prepare-ibm-mq-libs:
     name: Prepare IBM MQ client libraries for build
@@ -223,101 +186,6 @@ jobs:
           name: ibm-mq-libs
           path: ${{ github.workspace }}/tmp/ibm_mq
           include-hidden-files: true
-      - name: Failure Notification
-        uses: rtCamp/action-slack-notify@v2
-        env:
-          SLACK_COLOR: 'danger'
-          SLACK_ICON_EMOJI: ':github-actions:'
-          SLACK_TITLE: 'Packaging IBM MQ libs fetch failed:'
-          SLACK_USERNAME: 'GitHub Actions'
-          SLACK_MESSAGE: |-
-              ${{ github.repository }}: Failed to fetch IBM MQ libs for package builds.
-              Checkout: ${{ steps.checkout.outcome }}
-              Fetch IBM MQ libs: ${{ steps.fetch-ibm-mq.outcome }}
-              Upload IBM MQ libs: ${{ steps.upload-ibm-mq.outcome }}
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
-        if: >-
-          ${{
-            failure()
-            && github.event_name != 'pull_request'
-            && startsWith(github.ref, 'refs/heads/master')
-            && github.repository == 'netdata/netdata'
-            && needs.file-check.outputs.run == 'true'
-          }}
-
-  prepare-topology-ip-intel-stock:
-    name: Prepare topology-ip-intel stock payload
-    runs-on: ubuntu-latest
-    needs:
-      - file-check
-    steps:
-      - name: Skip Check
-        id: skip
-        if: needs.file-check.outputs.run != 'true'
-        run: echo "SKIPPED"
-      - name: Checkout
-        id: checkout
-        if: needs.file-check.outputs.run == 'true'
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-          submodules: recursive
-      - name: Setup Go
-        id: setup-go
-        if: needs.file-check.outputs.run == 'true'
-        uses: actions/setup-go@v7
-        with:
-          go-version-file: src/go/go.mod
-      - name: Prepare synthetic stock payload
-        id: prepare-synthetic
-        if: needs.file-check.outputs.run == 'true' && github.event_name == 'pull_request'
-        run: |
-          .github/scripts/prepare-topology-ip-intel-stock.sh \
-            --mode synthetic \
-            --output-dir "${GITHUB_WORKSPACE}/.topology-ip-intel-stock"
-      - name: Prepare release stock payload
-        id: prepare-release
-        if: needs.file-check.outputs.run == 'true' && github.event_name != 'pull_request'
-        uses: nick-invision/retry@v4
-        with:
-          max_attempts: 3
-          retry_wait_seconds: 30
-          timeout_seconds: 1800
-          command: >
-            .github/scripts/prepare-topology-ip-intel-stock.sh
-            --mode release
-            --output-dir "${GITHUB_WORKSPACE}/.topology-ip-intel-stock"
-      - name: Upload topology-ip-intel stock payload
-        id: upload-stock
-        if: needs.file-check.outputs.run == 'true'
-        uses: actions/upload-artifact@v7.0.0
-        with:
-          name: topology-ip-intel-stock
-          path: ${{ github.workspace }}/.topology-ip-intel-stock/
-          include-hidden-files: true
-      - name: Failure Notification
-        uses: rtCamp/action-slack-notify@v2
-        env:
-          SLACK_COLOR: 'danger'
-          SLACK_ICON_EMOJI: ':github-actions:'
-          SLACK_TITLE: 'Topology stock payload preparation failed:'
-          SLACK_USERNAME: 'GitHub Actions'
-          SLACK_MESSAGE: |-
-              ${{ github.repository }}: Failed to prepare topology-ip-intel stock payload.
-              Checkout: ${{ steps.checkout.outcome }}
-              Setup Go: ${{ steps.setup-go.outcome }}
-              Prepare synthetic payload: ${{ steps.prepare-synthetic.outcome }}
-              Prepare release payload: ${{ steps.prepare-release.outcome }}
-              Upload stock payload: ${{ steps.upload-stock.outcome }}
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
-        if: >-
-          ${{
-            failure()
-            && github.event_name != 'pull_request'
-            && startsWith(github.ref, 'refs/heads/master')
-            && github.repository == 'netdata/netdata'
-            && needs.file-check.outputs.run == 'true'
-          }}
 
   build:
     name: Build
@@ -329,7 +197,6 @@ jobs:
       - version-check
       - file-check
       - prepare-ibm-mq-libs
-      - prepare-topology-ip-intel-stock
     strategy:
       matrix: ${{ fromJson(needs.matrix.outputs.matrix) }}
       # We intentiaonally disable the fail-fast behavior so that a
@@ -349,18 +216,6 @@ jobs:
         with:
           fetch-depth: 0 # We need full history for versioning
           submodules: recursive
-      - name: Set Sentry telemetry env vars
-        id: set-telemetry-env-vars
-        run: |
-          if [ "${{ github.repository }}" = 'netdata/netdata' ] && \
-             [ "${{ matrix.bundle_sentry }}" = 'true' ] && \
-             [ "${{ github.event_name }}" = 'workflow_dispatch' ]; then
-              echo "RELEASE_PIPELINE=Production" >> "${GITHUB_ENV}"
-              echo "UPLOAD_SENTRY=true" >> "${GITHUB_ENV}"
-          else
-              echo "RELEASE_PIPELINE=Unknown" >> "${GITHUB_ENV}"
-              echo "UPLOAD_SENTRY=false" >> "${GITHUB_ENV}"
-          fi
       - name: Setup QEMU
         id: qemu
         if: matrix.qemu && needs.file-check.outputs.run == 'true'
@@ -386,23 +241,14 @@ jobs:
         with:
           name: ibm-mq-libs
           path: ${{ github.workspace }}/tmp/ibm_mq
-      - name: Download topology-ip-intel stock payload
-        id: fetch-topology-stock
-        if: needs.file-check.outputs.run == 'true'
-        uses: actions/download-artifact@v8
-        with:
-          name: topology-ip-intel-stock
-          path: ${{ github.workspace }}/.topology-ip-intel-stock
       - name: Build Packages
         id: build
         if: needs.file-check.outputs.run == 'true'
         shell: bash
         run: |
           docker run --security-opt seccomp=unconfined -e DISABLE_TELEMETRY=1 -e VERSION=${{ needs.version-check.outputs.version }} \
-                     -e ENABLE_SENTRY=${{ matrix.bundle_sentry }} -e RELEASE_PIPELINE=${{ env.RELEASE_PIPELINE }} \
-                     -e BUILD_DESTINATION=${{ matrix.distro }}${{ matrix.version }}_${{ matrix.arch }} -e UPLOAD_SENTRY=${{ env.UPLOAD_SENTRY }} \
-                     -e SENTRY_AUTH_TOKEN=${{ secrets.SENTRY_CLI_TOKEN }} -e NETDATA_SENTRY_DSN=${{ secrets.SENTRY_DSN }} \
-                     -e NETDATA_TOPOLOGY_IP_INTEL_STOCK_DIR=/netdata/.topology-ip-intel-stock \
+                       \
+                     -e BUILD_DESTINATION=${{ matrix.distro }}${{ matrix.version }}_${{ matrix.arch }}  \
                      -e GOOS=$(echo ${{ matrix.platform }} | cut -f 1 -d '/') -e GOARCH=$(echo ${{ matrix.platform }} | cut -f 2 -d '/') \
                      --platform=${{ matrix.platform }} -v "$PWD":/netdata netdata/package-builders:${{ matrix.distro }}${{ matrix.version }}-${{ matrix.builder_rev }}
       - name: Save Packages
@@ -423,73 +269,3 @@ jobs:
                      -e VERSION=${{ needs.version-check.outputs.version }} -e DISTRO_VERSION=${{ matrix.version }} \
                      --platform=${{ matrix.platform }} -v "$PWD":/netdata ${{ matrix.base_image }} \
                      /netdata/.github/scripts/pkg-test.sh
-      - name: Import GPG Keys
-        id: import-keys
-        if: needs.file-check.outputs.run == 'true' && matrix.format == 'deb' && github.event_name != 'pull_request'
-        uses: crazy-max/ghaction-import-gpg@v7
-        with:
-          gpg_private_key: ${{ secrets.NETDATABOT_PACKAGE_SIGNING_KEY }}
-      - name: Sign DEB Packages
-        id: sign-deb
-        if: needs.file-check.outputs.run == 'true' && matrix.format == 'deb' && github.event_name != 'pull_request'
-        shell: bash
-        run: .github/scripts/deb-sign.sh artifacts ${{ steps.import-keys.outputs.fingerprint }}
-      - name: SSH setup
-        id: ssh-setup
-        if: github.event_name == 'workflow_dispatch' && github.repository == 'netdata/netdata' && needs.file-check.outputs.run == 'true'
-        uses: shimataro/ssh-key-action@v2
-        with:
-          key: ${{ secrets.NETDATABOT_PACKAGES_SSH_KEY }}
-          name: id_ecdsa
-          known_hosts: ${{ secrets.PACKAGES_KNOWN_HOSTS }}
-      - name: Upload to packages.netdata.cloud
-        id: package-upload
-        continue-on-error: true
-        if: github.event_name == 'workflow_dispatch' && github.repository == 'netdata/netdata' && needs.file-check.outputs.run == 'true'
-        run: |
-          .github/scripts/package-upload.sh \
-          packages.netdata.cloud \
-          ${{ matrix.repo_distro }} \
-          ${{ matrix.arch }} \
-          ${{ matrix.format }} \
-          ${{ needs.version-check.outputs.repo }}
-      - name: Upload to packages2.netdata.cloud
-        id: package2-upload
-        if: github.event_name == 'workflow_dispatch' && github.repository == 'netdata/netdata' && needs.file-check.outputs.run == 'true'
-        run: |
-          .github/scripts/package-upload.sh \
-          packages2.netdata.cloud \
-          ${{ matrix.repo_distro }} \
-          ${{ matrix.arch }} \
-          ${{ matrix.format }} \
-          ${{ needs.version-check.outputs.repo }}
-      - name: Failure Notification
-        uses: rtCamp/action-slack-notify@v2
-        env:
-          SLACK_COLOR: 'danger'
-          SLACK_ICON_EMOJI: ':github-actions:'
-          SLACK_TITLE: 'Package Build failed:'
-          SLACK_USERNAME: 'GitHub Actions'
-          SLACK_MESSAGE: |-
-              ${{ github.repository }}: ${{ matrix.repo_distro }} ${{ matrix.version }} package build for ${{ matrix.arch }} failed.
-              Checkout: ${{ steps.checkout.outcome }}
-              Setup QEMU: ${{ steps.qemu.outcome }}
-              Fetch images: ${{ steps.fetch-images.outcome }}
-              Fetch IBM MQ libs: ${{ steps.fetch-ibm-mq.outcome }}
-              Fetch topology stock payload: ${{ steps.fetch-topology-stock.outcome }}
-              Build: ${{ steps.build.outcome }}
-              Test: ${{ steps.test.outcome }}
-              Import GPG Keys: ${{ steps.import-keys.outcome }}
-              Sign DEB Packages: ${{ steps.sign-deb.outcome }}
-              Import SSH Key: ${{ steps.ssh-setup.outcome }}
-              Publish to packages.netdata.cloud: ${{ steps.package-upload.outcome }}
-              Publish to packages2.netdata.cloud: ${{ steps.package2-upload.outcome }}
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
-        if: >-
-          ${{
-            failure()
-            && github.event_name != 'pull_request'
-            && startsWith(github.ref, 'refs/heads/master')
-            && github.repository == 'netdata/netdata'
-            && needs.file-check.outputs.run == 'true'
-          }}
