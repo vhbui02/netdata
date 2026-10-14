@@ -33,7 +33,7 @@ jobs:
           git checkout -B $FEATURE_BRANCH upstream/master
 
           # Check if an exact line exists inside an exact function
-          if ! sed -n '/static inline bool http_access_user_has_enough_access_level_for_endpoint/,/}/p' "src/web/api/http_auth.h" | grep -q "return ((user & endpoint) == endpoint);"; then
+          if ! sed -n '/static inline bool http_access_user_has_enough_access_level_for_endpoint/,/}/p' "src/libnetdata/user-auth/http-access.h" | grep -q "return ((user & endpoint) == endpoint);"; then
             echo "::error::Auth patch failed! Upstream changed the http_access function. Update your regex."
             exit 1
           fi
@@ -55,7 +55,7 @@ jobs:
           fi
 
           # Bypass Netdata Cloud
-          sed -i '/static inline bool http_access_user_has_enough_access_level_for_endpoint/,/}/ s/[ \t]*return ((user & endpoint) == endpoint);/    return true;/' "src/web/api/http_auth.h"
+          sed -i '/static inline bool http_access_user_has_enough_access_level_for_endpoint/,/}/ s/[ \t]*return ((user & endpoint) == endpoint);/    return true;/' "src/libnetdata/user-auth/http-access.h"
 
           # Add the feature branch to the push triggers
           sed -i "s|      - master|      - master\n      - ${FEATURE_BRANCH}|" ".github/workflows/packaging.yml"
@@ -107,6 +107,6 @@ jobs:
           sed -i '/- name: Upload to packages2\.netdata\.cloud/,/needs\.version-check\.outputs\.repo/d' ".github/workflows/packaging.yml"
 
           # Commit and push to remote feature branch
-          git add "src/web/api/http_auth.h" ".github/workflows/packaging.yml"
+          git add "src/libnetdata/user-auth/http-access.h" ".github/workflows/packaging.yml"
           git commit -m "feature: bypass Netdata Cloud when accessing advanced features"
           git push origin $FEATURE_BRANCH --force-with-lease
